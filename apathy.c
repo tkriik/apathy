@@ -4,6 +4,7 @@
 #include <fcntl.h>
 
 #include <assert.h>
+#include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <getopt.h>
@@ -13,33 +14,54 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 void usage(void);
 
 #define VERSION         "0.1.0"
 
 #define RFC3339_PATTERN "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-#define IPV4_PATTERN    "[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}.[0-9]{1,3}"
+#define IPV4_PATTERN    "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
 
 /* Log size threshold after which multithreading is enabled. */
 #define MT_THRESHOLD     (2 * 1024 * 1024)
 
+#define MIN(A, B) ((A) < (B) ? (A) : (B))
+
 struct log_ctx {
-	const char *path;
 	size_t      len;
+	const char *path;
 	const char *src;
 };
 
+#define LC_FIELDS_MAX 5
+struct line_config {
+	int ts_rfc3339;
+	int ipv4_fst;
+	int ipv4_snd;
+	int request;
+	int useragent;
+
+	int nfields;
+	int fields[LC_FIELDS_MAX + 1];
+};
+
+struct result {
+	unsigned long fields_iterated;
+};
+
 struct thread_chunk {
+	size_t      size;
 	const char *start;
 	const char *end;
-	size_t      size;
 };
 
 struct thread_ctx {
-	struct log_ctx *log_ctx;
 	int    id;
+	struct log_ctx *log_ctx;
+	struct line_config *line_config;
 	struct thread_chunk chunk;
+	struct result result;
 };
 
 struct re_info {
@@ -47,32 +69,27 @@ struct re_info {
 	regex_t ipv4;
 };
 
-#define THREADS_DEFAULT   4
-#define THREADS_MAX       4096
-
+#define NTHREADS_DEFAULT   4
+#define NTHREADS_MAX       4096
 struct work_ctx {
 	int       nthreads;
-	pthread_t thread[THREADS_MAX];
-	struct    thread_ctx thread_ctx[THREADS_MAX];
+	pthread_t thread[NTHREADS_MAX];
+	struct    thread_ctx thread_ctx[NTHREADS_MAX];
 };
 
-struct line_config {
-	int total_fields;
-	int timestamp;
-	int ip_primary;
-	int ip_secondary;
-	int request;
-	int useragent;
+enum field_type {
+	FIELD_TS_RFC3339,
+	FIELD_IPV4,
+	FIELD_REQUEST,
+	FIELD_USERAGENT,
+	FIELD_UNKNOWN,
+	FIELD_STOP
 };
 
-struct line_view {
-	const char *src;
-	size_t      len;
-};
-
+#define NFIELDS_MAX 256
 struct field_view {
+	int         len;
 	const char *src;
-	size_t      len;
 };
 
 void *
@@ -116,105 +133,139 @@ compile_regex(regex_t *preg, const char *pattern)
 }
 
 int
-next_line(struct line_view *lv, const char *src, int skip_seek)
+get_fields(struct field_view *fvs, int max_fields, const char *src,
+           int skip_line_seek, const char **endp)
 {
-	assert(lv != NULL);
+	assert(fvs != NULL);
+	assert(0 < max_fields);
 	assert(src != NULL);
+	assert(endp != NULL);
+
+	enum {
+		FIELD_SEEK,
+		FIELD_STANDALONE,
+		FIELD_DOUBLE_QUOTED
+	} state = FIELD_SEEK;
 
 	char c;
+	int nfields = 0;
+	int i = 0;
 
-	if (skip_seek)
-		goto fill_line;
-
-	while (1) {
-		c = *src;
-		if (c == '\n') {
-			src++;
-			break;
-		}
-
-		if (c == '\0')
-			return 0;
-
-		src++;
-	}
-
-fill_line:
-	lv->src = src;
-	lv->len = 0;
+	if (skip_line_seek)
+		goto fill_fields;
 
 	while (1) {
-		c = *src;
+		c = *src++;
 		if (c == '\n' || c == '\0')
 			break;
-
-		lv->len++;
-		src++;
 	}
 
-	return 1;
-}
 
-/* TODO: delimiters */
-int
-next_field(struct field_view *fv, const char *src)
-{
-	assert(fv != NULL);
-	assert(src != NULL);
-
-	char c;
-
+fill_fields:
 	while (1) {
+		if (nfields == max_fields) {
+			*endp = src;
+			return nfields;
+		}
+
+		struct field_view *fv = &fvs[i];
 		c = *src;
 
-		switch (c) {
-		case '\n':
-		case '\0':
-			return 0;
-		case ' ':
-			src++;
-			continue;
-		default:
-			src++;
-			break;
+		switch (state) {
+		case FIELD_SEEK:
+			switch (c) {
+			case '\0':
+				*endp = NULL;
+				return nfields;
+			case '\n':
+				*endp = src;
+				return nfields;
+			case '\v':
+			case '\t':
+			case ' ':
+				src++;
+				continue;
+			case '"':
+				src++;
+				fv->len = 0;
+				fv->src = src;
+				nfields++;
+				state = FIELD_DOUBLE_QUOTED;
+				continue;
+			default:
+				fv->len = 1;
+				fv->src = src;
+				nfields++;
+				src++;
+				state = FIELD_STANDALONE;
+				continue;
+			}
+		case FIELD_STANDALONE:
+			switch (c) {
+			case '\v':
+			case '\t':
+			case ' ':
+				i++;
+				src++;
+				state = FIELD_SEEK;
+				continue;
+			case '\0':
+				*endp = NULL;
+				return nfields;
+			case '\n':
+				*endp = src;
+				return nfields;
+			default:
+				fv->len++;
+				src++;
+				continue;
+			}
+		case FIELD_DOUBLE_QUOTED:
+			switch (c) {
+			case '\0':
+				*endp = NULL;
+				return nfields;
+			case '\n':
+				*endp = src;
+				return nfields;
+			case '"':
+				i++;
+				src++;
+				state = FIELD_SEEK;
+				continue;
+			default:
+				fv->len++;
+				src++;
+				continue;
+			}
 		}
 	}
-
-	fv->src = src;
-	fv->len = 0;
-
-	while (1) {
-		c = *src;
-		switch (c) {
-		case '\n':
-		case '\0':
-			break;
-		default:
-			fv->len++;
-		}
-	}
-
-	return 1;
 }
 
 void *
 run_thread(void *ctx)
 {
-	struct      line_view lv;
-	int         has_next;
+	assert(ctx != NULL);
 
 	struct thread_ctx *thread_ctx = ctx;
 	struct log_ctx *log_ctx = thread_ctx->log_ctx;
+	const char *src = thread_ctx->chunk.start;
+	struct result *res = &thread_ctx->result;
 
-	if (log_ctx->src < thread_ctx->chunk.start)
-		has_next = next_line(&lv, thread_ctx->chunk.start, 0);
-	else
-		has_next = next_line(&lv, thread_ctx->chunk.start, 1);
+	while (1) {
+		if (thread_ctx->chunk.end <= src || src == NULL)
+			break;
 
-	if (has_next)
-		printf("%d:\n|%.*s|\n", thread_ctx->id, (int)lv.len, lv.src);
-	else
-		printf("%d:\tNO LINE\n", thread_ctx->id);
+		int skip_line_seek = log_ctx->src == src;
+		struct field_view fvs[NFIELDS_MAX] = {0};
+		get_fields(fvs, NFIELDS_MAX, src, skip_line_seek, &src);
+		struct line_config *lc = thread_ctx->line_config;
+		for (int i = 0; i < lc->nfields; i++) {
+			res->fields_iterated++;
+		}
+	} 
+
+	printf("%02d -- %lu fields iterated\n", thread_ctx->id, res->fields_iterated);
 
 	pthread_exit(NULL);
 }
@@ -234,19 +285,133 @@ init_re_info(struct re_info *re_info)
 	compile_regex(&re_info->ipv4, IPV4_PATTERN);
 }
 
+int
+regex_does_match(regex_t *preg, const char *s)
+{
+	regmatch_t pmatch[1];
+	return regexec(preg, s, 1, pmatch, 0) == 0;
+}
+
+enum field_type
+infer_field_type(struct field_view *fv, struct re_info *re_info)
+{
+#define FIELD_MAX 4096
+	char field[FIELD_MAX + 1] = {0};
+	int ncopy = MIN(fv->len, FIELD_MAX);
+	memcpy(field, fv->src, ncopy);
+
+	if (regex_does_match(&re_info->rfc3339, field)) {
+		printf("timestamp: %s\n", field);
+		return FIELD_TS_RFC3339;
+	}
+
+	if (regex_does_match(&re_info->ipv4, field)) {
+		printf("ipv4: %s\n", field);
+		return FIELD_IPV4;
+	}
+
+	// TODO: request, useragent
+
+	return FIELD_UNKNOWN;
+}
+
 void
-init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx)
+amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
+{
+	if (LC_FIELDS_MAX <= lc->nfields)
+		return;
+
+	switch (ftype) {
+	case FIELD_TS_RFC3339:
+		if (lc->ts_rfc3339 == -1)
+			lc->ts_rfc3339 = idx;
+		else
+			return;
+		break;
+	case FIELD_IPV4:
+		if (lc->ipv4_fst == -1)
+			lc->ipv4_fst = idx;
+		else if (lc->ipv4_snd == -1)
+			lc->ipv4_snd = idx;
+		else
+			return;
+		break;
+	default:
+		return;
+	}
+
+	lc->fields[lc->nfields] = idx;
+	lc->nfields++;
+}
+
+void
+check_line_config(struct line_config *lc)
+{
+	printf("%d line fields found\n", lc->nfields);
+}
+
+void
+init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
+		 struct re_info *re_info)
+{
+	assert(lc != NULL);
+	assert(log_ctx != NULL);
+	assert(re_info != NULL);
+
+	const char *src = log_ctx->src;
+
+	*lc = (struct line_config){
+		.nfields    =  0,
+		.ts_rfc3339 = -1,
+		.ipv4_fst   = -1,
+		.ipv4_snd   = -1,
+		.request    = -1,
+		.useragent  = -1
+	};
+
+	struct field_view fvs[NFIELDS_MAX] = {0};
+	const char *endp;
+	int nfields = get_fields(fvs, NFIELDS_MAX, src, 1, &endp);
+	for (int i = 0; i < nfields; i++) {
+		struct field_view *fv = &fvs[i];
+		enum field_type ftype = infer_field_type(fv, re_info);
+		amend_line_config(lc, ftype, i);
+		//printf("%02d: |%.*s|\n", i, fvs[i].len, fvs[i].src);
+	}
+	//printf("endp: %.40s\n", endp);
+	
+	check_line_config(lc);
+}
+
+void
+init_result(struct result *res)
+{
+	assert(res != NULL);
+
+	res->fields_iterated = 0;
+}
+
+void
+init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
+              struct line_config *lc)
 {
 	assert(work_ctx != NULL);
 
-	if (nthreads == -1)
-		nthreads = THREADS_DEFAULT;
-	else if (log_ctx->len < MT_THRESHOLD)
+	if (log_ctx->len < MT_THRESHOLD)
 		nthreads = 1;
-	else if (nthreads > THREADS_MAX)
-		errx(1, "thread count must be under %d\n", THREADS_MAX);
+	else if (nthreads == -1) {
+		nthreads = sysconf(_SC_NPROCESSORS_CONF);
+		if (nthreads == -1) {
+			warn("failed to read CPU core count, using %d threads by default",
+			     NTHREADS_DEFAULT);
+			nthreads = NTHREADS_DEFAULT;
+		}
+	}
 
-	assert(0 < nthreads && nthreads <= THREADS_MAX);
+	if (nthreads > NTHREADS_MAX)
+		errx(1, "thread count must be under %d\n", NTHREADS_MAX);
+
+	assert(0 < nthreads && nthreads <= NTHREADS_MAX);
 
 	work_ctx->nthreads = nthreads;
 
@@ -264,11 +429,13 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx)
 			end_offset = start_offset + chunk_size + chunk_rem;
 
 		thread_ctx = &work_ctx->thread_ctx[tid];
-		thread_ctx->log_ctx = log_ctx;
-		thread_ctx->id = tid;
+		thread_ctx->log_ctx     = log_ctx;
+		thread_ctx->line_config = lc;
+		thread_ctx->id          = tid;
 		thread_ctx->chunk.start = log_ctx->src + start_offset;
-		thread_ctx->chunk.end = log_ctx->src + end_offset;
-		thread_ctx->chunk.size = end_offset - start_offset;
+		thread_ctx->chunk.end   = log_ctx->src + end_offset;
+		thread_ctx->chunk.size  = end_offset - start_offset;
+		init_result(&thread_ctx->result);
 
 		int rc = pthread_create(&work_ctx->thread[tid], NULL,
 				        run_thread, (void *)thread_ctx);
@@ -288,6 +455,12 @@ cleanup_work_ctx(struct work_ctx *work_ctx)
 }
 
 void
+cleanup_result(struct result *res)
+{
+	assert(res != NULL);
+}
+
+void
 cleanup_re_info(struct re_info *re_info)
 {
 	assert(re_info != NULL);
@@ -296,36 +469,23 @@ cleanup_re_info(struct re_info *re_info)
 	regfree(&re_info->ipv4);
 }
 
-//void
-//init_line_config(void)
-//{
-//	struct line_view lv;
-//	const char *src = log_src;
-//	struct line_config *lc = &line_config;
-//
-//	src = log_src;
-//
-//	if (!next_line(&lv, src, 1))
-//		exit(EXIT_SUCCESS); /* Ignore empty logs */
-//
-//	lc->total_fields =  0;
-//	lc->timestamp    = -1;
-//	lc->ip_primary   = -1;
-//	lc->ip_secondary = -1;
-//	lc->request      = -1;
-//	lc->useragent    = -1;
-//}
-//
+void
+cleanup_log_ctx(struct log_ctx *log_ctx)
+{
+	if (munmap((char *)log_ctx->src, log_ctx->len) == -1)
+		warn("munmap");
+}
 
 int
 main(int argc, char **argv)
 {
 	//char *ignore_patterns = NULL;
 	//char *merge_patterns  = NULL;
-	long nthreads         = -1;
+	long nthreads = -1;
 
 	struct log_ctx log_ctx;
 	struct re_info re_info;
+	struct line_config lc;
 	struct work_ctx work_ctx;
 
 	while (1) {
@@ -389,10 +549,12 @@ main(int argc, char **argv)
 
 	init_log_ctx(&log_ctx, argv[0]);
 	init_re_info(&re_info);
-	init_work_ctx(&work_ctx, nthreads, &log_ctx);
+	init_line_config(&lc, &log_ctx, &re_info);
+	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc);
 
 	cleanup_work_ctx(&work_ctx);
 	cleanup_re_info(&re_info);
+	cleanup_log_ctx(&log_ctx);
 
 	return 0;
 }
