@@ -8,9 +8,11 @@
 #include <err.h>
 #include <errno.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
 #include <regex.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,13 +20,10 @@
 
 void usage(void);
 
-#define VERSION         "0.1.0"
-
-#define RFC3339_PATTERN "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-#define IPV4_PATTERN    "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
+#define VERSION "0.1.0"
 
 /* Log size threshold after which multithreading is enabled. */
-#define MT_THRESHOLD     (2 * 1024 * 1024)
+#define MT_THRESHOLD (4 * 1024 * 1024)
 
 #define MIN(A, B) ((A) < (B) ? (A) : (B))
 
@@ -34,16 +33,30 @@ struct log_ctx {
 	const char *src;
 };
 
+enum field_type {
+	FIELD_TS_RFC3339 = 1,
+	FIELD_IPV4,
+	FIELD_REQUEST,
+	FIELD_USERAGENT,
+	FIELD_UNKNOWN
+};
+
+struct field_idx {
+	enum field_type type;
+	int  i;
+};
+
 #define LC_FIELDS_MAX 5
 struct line_config {
-	int ts_rfc3339;
-	int ipv4_fst;
-	int ipv4_snd;
-	int request;
-	int useragent;
+	int    ts_rfc3339;
+	int    ipv4_fst;
+	int    ipv4_snd;
+	int    request;
+	int    useragent;
 
-	int nfields;
-	int fields[LC_FIELDS_MAX + 1];
+	int    ntotal_fields;
+	int    nfields;
+	struct field_idx indices[LC_FIELDS_MAX + 1];
 };
 
 struct result {
@@ -64,9 +77,15 @@ struct thread_ctx {
 	struct result result;
 };
 
+#define RFC3339_PATTERN   "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+#define IPV4_PATTERN      "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
+#define REQUEST_PATTERN   "(GET|HEAD|POST|PUT|OPTIONS|PATCH)\\s+(http|https)://.+"
+#define USERAGENT_PATTERN "Mozilla.+"
 struct re_info {
 	regex_t rfc3339;
 	regex_t ipv4;
+	regex_t request;
+	regex_t useragent;
 };
 
 #define NTHREADS_DEFAULT   4
@@ -77,19 +96,16 @@ struct work_ctx {
 	struct    thread_ctx thread_ctx[NTHREADS_MAX];
 };
 
-enum field_type {
-	FIELD_TS_RFC3339,
-	FIELD_IPV4,
-	FIELD_REQUEST,
-	FIELD_USERAGENT,
-	FIELD_UNKNOWN,
-	FIELD_STOP
-};
-
 #define NFIELDS_MAX 256
 struct field_view {
 	int         len;
 	const char *src;
+};
+
+struct req_info {
+	uint64_t ts;
+	uint64_t sid;
+	uint64_t rid;
 };
 
 void *
@@ -242,34 +258,6 @@ fill_fields:
 	}
 }
 
-void *
-run_thread(void *ctx)
-{
-	assert(ctx != NULL);
-
-	struct thread_ctx *thread_ctx = ctx;
-	struct log_ctx *log_ctx = thread_ctx->log_ctx;
-	const char *src = thread_ctx->chunk.start;
-	struct result *res = &thread_ctx->result;
-
-	while (1) {
-		if (thread_ctx->chunk.end <= src || src == NULL)
-			break;
-
-		int skip_line_seek = log_ctx->src == src;
-		struct field_view fvs[NFIELDS_MAX] = {0};
-		get_fields(fvs, NFIELDS_MAX, src, skip_line_seek, &src);
-		struct line_config *lc = thread_ctx->line_config;
-		for (int i = 0; i < lc->nfields; i++) {
-			res->fields_iterated++;
-		}
-	} 
-
-	printf("%02d -- %lu fields iterated\n", thread_ctx->id, res->fields_iterated);
-
-	pthread_exit(NULL);
-}
-
 void
 init_log_ctx(struct log_ctx *ctx, const char *path)
 {
@@ -281,8 +269,11 @@ void
 init_re_info(struct re_info *re_info)
 {
 	assert(re_info != NULL);
+
 	compile_regex(&re_info->rfc3339, RFC3339_PATTERN);
 	compile_regex(&re_info->ipv4, IPV4_PATTERN);
+	compile_regex(&re_info->request, REQUEST_PATTERN);
+	compile_regex(&re_info->useragent, USERAGENT_PATTERN);
 }
 
 int
@@ -300,17 +291,19 @@ infer_field_type(struct field_view *fv, struct re_info *re_info)
 	int ncopy = MIN(fv->len, FIELD_MAX);
 	memcpy(field, fv->src, ncopy);
 
-	if (regex_does_match(&re_info->rfc3339, field)) {
-		printf("timestamp: %s\n", field);
+	if (regex_does_match(&re_info->rfc3339, field))
 		return FIELD_TS_RFC3339;
-	}
 
-	if (regex_does_match(&re_info->ipv4, field)) {
-		printf("ipv4: %s\n", field);
+	if (regex_does_match(&re_info->ipv4, field))
 		return FIELD_IPV4;
-	}
 
-	// TODO: request, useragent
+	if (regex_does_match(&re_info->request, field))
+		return FIELD_REQUEST;
+
+	if (regex_does_match(&re_info->useragent, field))
+		return FIELD_USERAGENT;
+
+	// TODO: useragent
 
 	return FIELD_UNKNOWN;
 }
@@ -336,18 +329,174 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 		else
 			return;
 		break;
+	case FIELD_REQUEST:
+		if (lc->request == -1)
+			lc->request = idx;
+		else
+			return;
+		break;
+	case FIELD_USERAGENT:
+		if (lc->useragent == -1)
+			lc->useragent = idx;
+		else
+			return;
+		break;
 	default:
 		return;
 	}
 
-	lc->fields[lc->nfields] = idx;
+	lc->indices[lc->nfields] = (struct field_idx){
+		.type = ftype,
+		.i    = idx
+	};
 	lc->nfields++;
 }
 
 void
 check_line_config(struct line_config *lc)
 {
-	printf("%d line fields found\n", lc->nfields);
+	if (lc->ts_rfc3339 == -1)
+		warnx("warning: timestamp field not found");
+	if (lc->ipv4_fst == -1 || lc->ipv4_snd == -1)
+		warnx("warning: source and/or destination address fields not found");
+	if (lc->request == -1)
+		errx(1, "error: request field not found");
+	if (lc->useragent == -1)
+		warnx("warning: user agent field not found");
+}
+
+/*
+ * Convert RFC3339 timestamp to an roughly estimated number of milliseconds.
+ *
+ * We don't need accurate timekeeping since we are only
+ * concerned with average durations between path transitions, so
+ * we can take this faster shortcut with manual parsing.
+ */
+uint64_t
+ts_rfc3339_to_ms(const char *s)
+{
+	const char ctoi[256] = {
+	    ['1'] = 1,  ['2'] = 2, ['3'] = 3, ['4'] = 4, ['5'] = 5,
+	    ['6'] = 6,  ['7'] = 7, ['8'] = 8, ['9'] = 9
+	};
+
+	uint64_t year = (ctoi[(int)s[0]] * 1000
+	              +  ctoi[(int)s[1]] * 100
+	              +  ctoi[(int)s[2]] * 10
+	              +  ctoi[(int)s[3]])
+	              - 1970;
+	s += 5; // Skip '-'
+	uint64_t month = ctoi[(int)s[0]] * 10
+	               + ctoi[(int)s[1]];
+	s += 3; // Skip '-'
+	uint64_t day = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip 'T'
+	uint64_t hour = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip ':'
+	uint64_t min = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip ':'
+	uint64_t sec = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip '.'
+	uint64_t ms = ctoi[(int)s[0]] * 100
+	            + ctoi[(int)s[1]] * 10
+	            + ctoi[(int)s[2]];
+
+#define MS_IN_YEAR  31104000000ULL
+#define MS_IN_MONTH 2592000000ULL
+#define MS_IN_DAY   86400000ULL
+#define MS_IN_HOUR  3600000ULL
+#define MS_IN_MIN   60000ULL
+#define MS_IN_SEC   1000ULL
+	return year  * MS_IN_YEAR
+	     + month * MS_IN_MONTH
+	     + day   * MS_IN_DAY
+	     + hour  * MS_IN_HOUR
+	     + min   * MS_IN_MIN
+	     + sec   * MS_IN_SEC
+	     + ms;
+}
+
+#define FNV_PRIME64 1099511628211ULL
+#define FNV_BASIS64 14695981039346656037ULL
+uint64_t
+hash64_init(void)
+{
+	return FNV_BASIS64;
+}
+
+uint64_t
+hash64_update(uint64_t hash, const char *s, size_t len)
+{
+	for (size_t i = 0; i < len; i++) {
+		hash ^= s[i];
+		hash *= FNV_PRIME64;
+	}
+	return hash;
+}
+
+void *
+run_thread(void *ctx)
+{
+	assert(ctx != NULL);
+
+	struct thread_ctx *thread_ctx = ctx;
+	struct log_ctx *log_ctx = thread_ctx->log_ctx;
+	const char *src = thread_ctx->chunk.start;
+	struct line_config *lc = thread_ctx->line_config;
+	struct result *res = &thread_ctx->result;
+
+	while (1) {
+		if (thread_ctx->chunk.end <= src || src == NULL)
+			break;
+
+		int skip_line_seek = log_ctx->src == src;
+		struct field_view fvs[NFIELDS_MAX] = {0};
+
+		int nfields = get_fields(fvs, NFIELDS_MAX, src, skip_line_seek, &src);
+		if (nfields != lc->ntotal_fields)
+			continue;
+
+
+		uint64_t ts;
+		uint64_t sid = hash64_init();
+		uint64_t rid;
+
+		//printf("--------------------------------------------------------------------------------\n");
+		for (int i = 0; i < lc->nfields; i++) {
+			struct field_idx *fidx = &lc->indices[i];
+			struct field_view *fv = &fvs[fidx->i];
+
+			switch (fidx->type) {
+			case FIELD_TS_RFC3339:
+				ts = ts_rfc3339_to_ms(fv->src);
+				//printf("timestamp: %" PRIu64 "\n", ts);
+				break;
+			case FIELD_IPV4:
+				sid = hash64_update(sid, fv->src, fv->len);
+				//printf("ipv4: %.*s\n", fv->len, fv->src);
+				break;
+			case FIELD_REQUEST:
+				//printf("request: %.*s\n", fv->len, fv->src);
+				break;
+			case FIELD_USERAGENT:
+				sid = hash64_update(sid, fv->src, fv->len);
+				//printf("useragent: %.*s\n", fv->len, fv->src);
+				break;
+			default:
+				break;
+			}
+
+			res->fields_iterated++;
+		}
+
+		printf("%" PRIu64 "\n", sid);
+		//printf("ts = %" PRIu64 ", sid = %" PRIu64 ", rid = ?\n", ts, sid);
+		//printf("--------------------------------------------------------------------------------\n");
+	} 
+
+	//printf("%02d -- %lu fields iterated\n", thread_ctx->id, res->fields_iterated);
+
+	pthread_exit(NULL);
 }
 
 void
@@ -360,18 +509,22 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 
 	const char *src = log_ctx->src;
 
+	memset(lc, 0, sizeof(*lc));
 	*lc = (struct line_config){
-		.nfields    =  0,
-		.ts_rfc3339 = -1,
-		.ipv4_fst   = -1,
-		.ipv4_snd   = -1,
-		.request    = -1,
-		.useragent  = -1
+		.ts_rfc3339    = -1,
+		.ipv4_fst      = -1,
+		.ipv4_snd      = -1,
+		.request       = -1,
+		.useragent     = -1,
+
+		.ntotal_fields =  0,
+		.nfields       =  0
 	};
 
 	struct field_view fvs[NFIELDS_MAX] = {0};
 	const char *endp;
 	int nfields = get_fields(fvs, NFIELDS_MAX, src, 1, &endp);
+	lc->ntotal_fields = nfields;
 	for (int i = 0; i < nfields; i++) {
 		struct field_view *fv = &fvs[i];
 		enum field_type ftype = infer_field_type(fv, re_info);
