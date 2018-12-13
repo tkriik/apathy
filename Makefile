@@ -1,6 +1,6 @@
 CC=		cc
 
-CFLAGS=		-ansi \
+CFLAGS=		-std=c99 \
 		-pedantic \
 		-Wall \
 		-Wextra \
@@ -12,7 +12,7 @@ CFLAGS=		-ansi \
 		-g \
 		-O0
 
-CFLAGS_RELEASE=	-ansi \
+CFLAGS_RELEASE=	-std=c99 \
 		-pedantic \
 		-Wall \
 		-Wextra \
