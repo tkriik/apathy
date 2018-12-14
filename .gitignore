@@ -2,6 +2,7 @@
 apathy
 test.log
 tags
+callgrind.*
 
 # Prerequisites
 *.d

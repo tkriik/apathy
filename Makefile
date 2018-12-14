@@ -10,7 +10,7 @@ CFLAGS=		-std=c99 \
 		-Wno-unused-but-set-variable \
 		-D_DEFAULT_SOURCE \
 		-g \
-		-O0
+		-O2
 
 CFLAGS_RELEASE=	-std=c99 \
 		-pedantic \
@@ -18,6 +18,7 @@ CFLAGS_RELEASE=	-std=c99 \
 		-Wextra \
 		-Werror \
 		-Wno-overlength-strings \
+		-Wno-sign-compare \
 		-pedantic-errors \
 		-D_DEFAULT_SOURCE \
 		-O2

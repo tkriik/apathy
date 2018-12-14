@@ -47,8 +47,8 @@
  *
  *    - run_thread()
  *
- *    4.1. A session ID is constructed from one line, which is a 64-bit hash
- *         of one or more of the following fields:
+ *    4.1. A session ID (sid) is constructed from one line, which is a 64-bit
+ *         hash consisting of one or more of the following fields:
  *           * first IP address (should be source address)
  *           * second IP address (should be destination address)
  *           * user agent
@@ -61,7 +61,9 @@
  *         IP address (whichever is the source address) plus the user agent,
  *         for more accuracy. This is the default mode.
  *
- *    4.2 TODO
+ *    4.2 A truncated copy of the request field, with only method and URL,
+ *        is stored in a hash table, for avoiding duplicate storage for
+ *        identical requests.
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -83,7 +85,7 @@
 #include <string.h>
 #include <unistd.h>
 
-void usage(void);
+#include "uthash.h"
 
 #define VERSION "0.1.0"
 
@@ -124,7 +126,7 @@ struct field_idx {
  */
 struct line_config {
 #define LC_FIELDS_MAX 5
-	int    ts_rfc3339; /* Index to RFC3339 timestamp; optional */
+	int    ts_rfc3339; /* Index to RFC3339 timestamp; REQUIRED */
 	int    ip1;        /* Index to first IP address;  optional */
 	int    ip2;        /* Index to second IP address; optional */
 	int    request;    /* Index to request field;     REQUIRED */
@@ -134,9 +136,6 @@ struct line_config {
 	 * While the IP address fields and user agent fields are optional
 	 * individually, it's required to have at least one of the three
 	 * to get any meaningful path info out of the log file.
-	 *
-	 * If the timestamp field is not found, we won't report duration
-	 * info for request transitions.
 	 */
 
 	int         ntotal_fields;
@@ -145,8 +144,15 @@ struct line_config {
 	const char *sfields;
 };
 
-struct result {
-	unsigned long fields_iterated;
+/* Unique request data, stored in a hash table. */
+struct request_entry {
+	char           *data;
+	UT_hash_handle  hh;
+};
+
+struct request_table {
+	struct request_entry *handle;
+	pthread_rwlock_t      lock;
 };
 
 /* Working area for one thread. */
@@ -159,10 +165,11 @@ struct thread_chunk {
 /* Thread-specific context. */
 struct thread_ctx {
 	int    id;
+
 	struct log_ctx *log_ctx;
 	struct line_config *line_config;
 	struct thread_chunk chunk;
-	struct result result;
+	struct request_table *request_table;
 };
 
 /*
@@ -202,16 +209,8 @@ struct field_view {
 	const char *src;
 };
 
-struct req_data {
-	int         len;
-	const char *src;
-};
-
-struct req_info {
-	uint64_t ts;
-	uint64_t sid;
-	uint64_t rid;
-};
+void debug_request_table(struct request_table *);
+void usage(void);
 
 void *
 mmap_file(const char *path, size_t *sizep)
@@ -484,14 +483,16 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 void
 check_line_config(struct line_config *lc)
 {
-	if (lc->ts_rfc3339 == -1)
-		warnx("warning: timestamp field not found");
 	if (lc->ip1 == -1 || lc->ip2 == -1)
 		warnx("warning: source and/or destination IP address fields not found");
-	if (lc->request == -1)
-		errx(1, "error: request field not found");
 	if (lc->useragent == -1)
 		warnx("warning: user agent field not found");
+	if (lc->ts_rfc3339 == -1)
+		warnx("error: timestamp field not found");
+	if (lc->request == -1)
+		errx(1, "error: request field not found");
+	if (lc->ip1 == -1 && lc->ip2 == -1 && lc->useragent == -1)
+		errx(1, "error: source IP address, destination IP address nor user agent field found");
 }
 
 /*
@@ -504,7 +505,7 @@ check_line_config(struct line_config *lc)
 uint64_t
 ts_rfc3339_to_ms(const char *s)
 {
-	const char ctoi[256] = {
+	static const char ctoi[256] = {
 	    ['0'] = 0, ['1'] = 1, ['2'] = 2, ['3'] = 3, ['4'] = 4,
 	    ['5'] = 5, ['6'] = 6, ['7'] = 7, ['8'] = 8, ['9'] = 9
 	};
@@ -551,7 +552,7 @@ ts_rfc3339_to_ms(const char *s)
  *
  * http://www.isthe.com/chongo/tech/comp/fnv/
  *
- * TODO: use GCC optimization with shifts
+ * TODO: use GCC optimization with shifts, inline
  */
 #define FNV_PRIME64 1099511628211ULL
 #define FNV_BASIS64 14695981039346656037ULL
@@ -565,10 +566,88 @@ uint64_t
 hash64_update(uint64_t hash, const char *s, size_t len)
 {
 	for (size_t i = 0; i < len; i++) {
+		/* TODO: use GCC optimization with shifts */
 		hash ^= s[i];
 		hash *= FNV_PRIME64;
 	}
 	return hash;
+}
+
+/*
+ * Stores a request field pointed to by src into the request table rt.
+ * Returns a pointer to either a newly allocated string, or an existing
+ * string, if an identical request field has been stored in the table already.
+ */
+const char *
+set_request_entry(const char *src, struct request_table *rt)
+{
+	assert(src != NULL);
+
+	int rc;
+	const char *s = src;
+	int req_len = 0;
+	int spaces_remaining = 2;
+	while (0 < spaces_remaining) {
+		char c = *s++;
+		switch (c) {
+		case ' ':
+			spaces_remaining--;
+			break;
+		case '?':
+		case '"':
+			req_len++;
+			goto effective_req;
+		case '\0':
+		case '\n':
+		case '\v':
+		case '\t':
+			errx(1, "error: unexpected whitespace or null terminator after request field: %.*s\n",
+			     req_len + 1, s);
+			/* NOTREACHED */
+			break;
+		default:
+			req_len++;
+			break;
+		}
+	}
+
+	struct request_entry *req = NULL;
+effective_req:
+
+	rc = pthread_rwlock_rdlock(&rt->lock);
+	if (rc != 0)
+		err(1, "error: pthread_rwlock_rdlock");
+
+	HASH_FIND(hh, rt->handle, src, req_len, req);
+	if (req != NULL)
+		goto finish;
+
+	rc = pthread_rwlock_unlock(&rt->lock);
+	if (rc != 0)
+		err(1, "error: pthread_rwlock_unlock");
+
+	req = calloc(1, sizeof(*req));
+	if (req == NULL)
+		err(1, "error: calloc");
+
+	req->data = calloc(1, req_len + 1);
+	if (req->data == NULL)
+		err(1, "error: calloc");
+	memcpy(req->data, src, req_len);
+
+	rc = pthread_rwlock_wrlock(&rt->lock);
+	if (rc != 0)
+		err(1, "error: pthread_rwlock_wrlock");
+
+	HASH_ADD_KEYPTR(hh, rt->handle, req->data, req_len, req);
+	printf("added: %s\n", req->data);
+
+finish:
+	rc = pthread_rwlock_unlock(&rt->lock);
+	if (rc != 0)
+		err(1, "error: pthread_rwlock_unlock");
+
+	return req->data;
 }
 
 void *
@@ -580,7 +659,7 @@ run_thread(void *ctx)
 	struct log_ctx *log_ctx = thread_ctx->log_ctx;
 	const char *src = thread_ctx->chunk.start;
 	struct line_config *lc = thread_ctx->line_config;
-	struct result *res = &thread_ctx->result;
+	struct request_table *rt = thread_ctx->request_table;
 
 	while (1) {
 		if (thread_ctx->chunk.end <= src || src == NULL)
@@ -595,9 +674,8 @@ run_thread(void *ctx)
 
 		uint64_t ts;
 		uint64_t sid = hash64_init();
-		uint64_t rid;
+		const char *req_data = NULL;
 
-		//printf("--------------------------------------------------------------------------------\n");
 		for (int i = 0; i < lc->nfields; i++) {
 			struct field_idx *fidx = &lc->indices[i];
 			struct field_view *fv = &fvs[fidx->i];
@@ -605,36 +683,26 @@ run_thread(void *ctx)
 			if (fidx->is_session)
 				sid = hash64_update(sid, fv->src, fv->len);
 
-			//switch (fidx->type) {
-			//case FIELD_TS_RFC3339:
-			//	ts = ts_rfc3339_to_ms(fv->src);
-			//	//printf("%.*s -> %" PRIu64 "\n", fv->len, fv->src, ts);
-			//	//printf("timestamp: %" PRIu64 "\n", ts);
-			//	break;
-			//case FIELD_IPADDR:
-			//	sid = hash64_update(sid, fv->src, fv->len);
-			//	//printf("ipv4: %.*s\n", fv->len, fv->src);
-			//	break;
-			//case FIELD_REQUEST:
-			//	//printf("request: %.*s\n", fv->len, fv->src);
-			//	break;
-			//case FIELD_USERAGENT:
-			//	sid = hash64_update(sid, fv->src, fv->len);
-			//	//printf("useragent: %.*s\n", fv->len, fv->src);
-			//	break;
-			//default:
-			//	break;
-			//}
-
-			res->fields_iterated++;
+			switch (fidx->type) {
+			case FIELD_TS_RFC3339:
+				ts = ts_rfc3339_to_ms(fv->src);
+				break;
+			case FIELD_IPADDR:
+				sid = hash64_update(sid, fv->src, fv->len);
+				break;
+			case FIELD_REQUEST:
+				req_data = set_request_entry(fv->src, rt);
+				break;
+			case FIELD_USERAGENT:
+				sid = hash64_update(sid, fv->src, fv->len);
+				break;
+			default:
+				break;
+			}
 		}
 
-		printf("%" PRIu64 "\n", sid);
-		//printf("ts = %" PRIu64 ", sid = %" PRIu64 ", rid = ?\n", ts, sid);
-		//printf("--------------------------------------------------------------------------------\n");
+		//printf("%" PRIu64 " %016" PRIx64 " %s\n", ts, sid, req_data);
 	} 
-
-	//printf("%02d -- %lu fields iterated\n", thread_ctx->id, res->fields_iterated);
 
 	pthread_exit(NULL);
 }
@@ -670,26 +738,28 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 		struct field_view *fv = &fvs[i];
 		enum field_type ftype = infer_field_type(fv, re_info);
 		amend_line_config(lc, ftype, i);
-		//printf("%02d: |%.*s|\n", i, fvs[i].len, fvs[i].src);
 	}
-	//printf("endp: %.40s\n", endp);
 	
 	check_line_config(lc);
 }
 
 void
-init_result(struct result *res)
+init_request_table(struct request_table *rt)
 {
-	assert(res != NULL);
+	rt->handle = NULL;
 
-	res->fields_iterated = 0;
+	int rc = pthread_rwlock_init(&rt->lock, NULL);
+	if (rc != 0)
+		err(1, "error: pthread_rwlock_init");
 }
 
 void
 init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
-              struct line_config *lc)
+              struct line_config *lc, struct request_table *rt)
 {
 	assert(work_ctx != NULL);
+
+	int rc;
 
 #define MT_THRESHOLD (4 * 1024 * 1024)
 	/* If log size is under MT_THRESHOLD, we use 1 thread. */
@@ -725,16 +795,17 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 			end_offset = start_offset + chunk_size + chunk_rem;
 
 		thread_ctx = &work_ctx->thread_ctx[tid];
-		thread_ctx->log_ctx     = log_ctx;
-		thread_ctx->line_config = lc;
-		thread_ctx->id          = tid;
-		thread_ctx->chunk.start = log_ctx->src + start_offset;
-		thread_ctx->chunk.end   = log_ctx->src + end_offset;
-		thread_ctx->chunk.size  = end_offset - start_offset;
-		init_result(&thread_ctx->result);
 
-		int rc = pthread_create(&work_ctx->thread[tid], NULL,
-				        run_thread, (void *)thread_ctx);
+		thread_ctx->log_ctx       = log_ctx;
+		thread_ctx->line_config   = lc;
+		thread_ctx->id            = tid;
+		thread_ctx->chunk.start   = log_ctx->src + start_offset;
+		thread_ctx->chunk.end     = log_ctx->src + end_offset;
+		thread_ctx->chunk.size    = end_offset - start_offset;
+		thread_ctx->request_table = rt;
+
+		rc = pthread_create(&work_ctx->thread[tid], NULL, run_thread,
+		                    (void *)thread_ctx);
 		if (rc != 0)
 			err(1, "pthread_create");
 	}
@@ -751,9 +822,14 @@ cleanup_work_ctx(struct work_ctx *work_ctx)
 }
 
 void
-cleanup_result(struct result *res)
+cleanup_request_table(struct request_table *rt)
 {
-	assert(res != NULL);
+	struct request_entry *r, *tmp;
+	HASH_ITER(hh, rt->handle, r, tmp) {
+		HASH_DEL(rt->handle, r);
+		free(r->data);
+		free(r);
+	}
 }
 
 void
@@ -763,6 +839,8 @@ cleanup_re_info(struct re_info *re_info)
 
 	regfree(&re_info->rfc3339);
 	regfree(&re_info->ipv4);
+	regfree(&re_info->request);
+	regfree(&re_info->useragent);
 }
 
 void
@@ -803,6 +881,7 @@ main(int argc, char **argv)
 	struct log_ctx log_ctx;
 	struct re_info re_info;
 	struct line_config lc;
+	struct request_table rt;
 	struct work_ctx work_ctx;
 
 	while (1) {
@@ -822,13 +901,6 @@ main(int argc, char **argv)
 			break;
 
 		switch (c) {
-		case 0:
-			printf("option %s", long_opts[opt_idx].name);
-			if (optarg)
-				printf(" with arg %s", optarg);
-			printf("\n");
-			break;
-
 		case 'h':
 			usage();
 			break;
@@ -871,9 +943,12 @@ main(int argc, char **argv)
 	init_log_ctx(&log_ctx, argv[0]);
 	init_re_info(&re_info);
 	init_line_config(&lc, &log_ctx, &re_info, session_fields);
-	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc);
+	init_request_table(&rt);
+	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc, &rt);
 
 	cleanup_work_ctx(&work_ctx);
+	debug_request_table(&rt);
+	cleanup_request_table(&rt);
 	cleanup_re_info(&re_info);
 	cleanup_log_ctx(&log_ctx);
 
@@ -908,4 +983,13 @@ usage(void)
 "    <ACCESS_LOG>    Access log file containing HTTP request timestamps, IP addresses, methods, URLs and User Agent headers\n",
 	    VERSION);
 	exit(EXIT_FAILURE);
+}
+
+void
+debug_request_table(struct request_table *rt)
+{
+	struct request_entry *r, *tmp;
+	HASH_ITER(hh, rt->handle, r, tmp) {
+		printf("%p %s\n", r->data, r->data);
+	}
 }
