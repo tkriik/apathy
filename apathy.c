@@ -1,3 +1,68 @@
+/*
+ MIT License
+
+ Copyright (c) 2018 Tanel Kriik
+
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+ */
+
+/*
+ * How this program works:
+ *
+ * 1. We map the log file into memory, so that multiple gigabyte sized
+ *    log files pose no issues.
+ *
+ *    - init_log_ctx()
+ *
+ * 2. We look at the first line to infer indices of fields relevant to us,
+ *    such as timestamp, IP addresses, request info (method + URL)
+ *    and user agent.
+ *
+ *    - init_line_config()
+ *
+ * 3. We split the memory area into N chunks, where N is the number of threads
+ *    available. By default, we use the number of logical CPU cores as
+ *    the thread count.
+ *
+ *    - init_work_ctx()
+ *
+ * 4. Each threads scans their respective chunks for lines, from which
+ *    they split the line into fields delimited by spaces or double quotes.
+ *
+ *    - run_thread()
+ *
+ *    4.1. A session ID is constructed from one line, which is a 64-bit hash
+ *         of one or more of the following fields:
+ *           * first IP address (should be source address)
+ *           * second IP address (should be destination address)
+ *           * user agent
+ *
+ *         If the log file is from a proxy (such as Cloudfront), it is
+ *         recommended to use only the user agent string for identifying
+ *         one session, since the IP addresses don't correspond to the
+ *         actual origins of a request.
+ *         Otherwise it is recommended to use the first or second
+ *         IP address (whichever is the source address) plus the user agent,
+ *         for more accuracy. This is the default mode.
+ *
+ *    4.2 TODO
+ */
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -22,53 +87,76 @@ void usage(void);
 
 #define VERSION "0.1.0"
 
-/* Log size threshold after which multithreading is enabled. */
-#define MT_THRESHOLD (4 * 1024 * 1024)
-
 #define MIN(A, B) ((A) < (B) ? (A) : (B))
 
 struct log_ctx {
-	size_t      len;
-	const char *path;
-	const char *src;
+	size_t      len;  /* Size of log file plus one */
+	const char *path; /* Path to log file */
+	const char *src;  /* Memory-mapped log contents */
 };
 
 enum field_type {
 	FIELD_TS_RFC3339 = 1,
-	FIELD_IPV4,
+	FIELD_IPADDR,
 	FIELD_REQUEST,
 	FIELD_USERAGENT,
 	FIELD_UNKNOWN
 };
 
+/* Tells what type of field lies at a certain index. */
 struct field_idx {
 	enum field_type type;
 	int  i;
+	int  is_session; /* 1 if this field is used to construct session IDs */
 };
 
-#define LC_FIELDS_MAX 5
+/*
+ * This is used to index certain fields in each line.
+ *
+ * The program reads the first line of a log file and uses that to
+ * infer indices of fields relevant to us, so that when we are doing
+ * a full scan we can find the desired fields more quickly.
+ *
+ * This only works if each line contains the same number of fields in
+ * same order, but that should not be a problem with most log files.
+ *
+ * All of the 5 indices below are -1 if they're not found.
+ */
 struct line_config {
-	int    ts_rfc3339;
-	int    ipv4_fst;
-	int    ipv4_snd;
-	int    request;
-	int    useragent;
+#define LC_FIELDS_MAX 5
+	int    ts_rfc3339; /* Index to RFC3339 timestamp; optional */
+	int    ip1;        /* Index to first IP address;  optional */
+	int    ip2;        /* Index to second IP address; optional */
+	int    request;    /* Index to request field;     REQUIRED */
+	int    useragent;  /* Index to user agent string; optional */
+	/*
+	 * XXX:
+	 * While the IP address fields and user agent fields are optional
+	 * individually, it's required to have at least one of the three
+	 * to get any meaningful path info out of the log file.
+	 *
+	 * If the timestamp field is not found, we won't report duration
+	 * info for request transitions.
+	 */
 
-	int    ntotal_fields;
-	int    nfields;
-	struct field_idx indices[LC_FIELDS_MAX + 1];
+	int         ntotal_fields;
+	int         nfields;
+	struct      field_idx indices[LC_FIELDS_MAX + 1];
+	const char *sfields;
 };
 
 struct result {
 	unsigned long fields_iterated;
 };
 
+/* Working area for one thread. */
 struct thread_chunk {
 	size_t      size;
 	const char *start;
-	const char *end;
+	const char *end;   /* start + size bytes */
 };
 
+/* Thread-specific context. */
 struct thread_ctx {
 	int    id;
 	struct log_ctx *log_ctx;
@@ -77,27 +165,44 @@ struct thread_ctx {
 	struct result result;
 };
 
+/*
+ * These patterns are deliberately liberal, since we don't use them in
+ * any strict way.
+ */
+struct re_info {
 #define RFC3339_PATTERN   "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
 #define IPV4_PATTERN      "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
 #define REQUEST_PATTERN   "(GET|HEAD|POST|PUT|OPTIONS|PATCH)\\s+(http|https)://.+"
 #define USERAGENT_PATTERN "Mozilla.+"
-struct re_info {
 	regex_t rfc3339;
 	regex_t ipv4;
 	regex_t request;
 	regex_t useragent;
 };
 
+/*
+ * Work context with all threads.
+ * We limit threads to 4096 to avoid memory allocation.
+ */
+struct work_ctx {
 #define NTHREADS_DEFAULT   4
 #define NTHREADS_MAX       4096
-struct work_ctx {
 	int       nthreads;
 	pthread_t thread[NTHREADS_MAX];
 	struct    thread_ctx thread_ctx[NTHREADS_MAX];
 };
 
-#define NFIELDS_MAX 256
+/*
+ * View to a single field in a line.
+ * We limit field views to 256 to avoid memory allocation.
+ */
 struct field_view {
+#define NFIELDS_MAX 256
+	int         len;
+	const char *src;
+};
+
+struct req_data {
 	int         len;
 	const char *src;
 };
@@ -148,6 +253,21 @@ compile_regex(regex_t *preg, const char *pattern)
 	}
 }
 
+/*
+ * Fills *fvs with at most max_fields number of field views
+ * found in *src, and stores the end of seeking area to **endp,
+ * or NULL if a '\0' is reached.
+ *
+ * If skip_line_seek is true, we assume we are at the beginning
+ * of a line. Otherwise we skip to the next line before
+ * parsing field views.
+ *
+ * Currently parses standalone fields, such as '1 2 3' into "1", "2" and "3",
+ * and double-quoted fields, so that '"GET http://my-api/"' is read as
+ * "GET http://my-api/" instead of '"GET' and 'http://my-api/"'.
+ *
+ * Returns the number of fields found.
+ */
 int
 get_fields(struct field_view *fvs, int max_fields, const char *src,
            int skip_line_seek, const char **endp)
@@ -295,7 +415,7 @@ infer_field_type(struct field_view *fv, struct re_info *re_info)
 		return FIELD_TS_RFC3339;
 
 	if (regex_does_match(&re_info->ipv4, field))
-		return FIELD_IPV4;
+		return FIELD_IPADDR;
 
 	if (regex_does_match(&re_info->request, field))
 		return FIELD_REQUEST;
@@ -314,6 +434,8 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 	if (LC_FIELDS_MAX <= lc->nfields)
 		return;
 
+	int is_session = 0;;
+
 	switch (ftype) {
 	case FIELD_TS_RFC3339:
 		if (lc->ts_rfc3339 == -1)
@@ -321,12 +443,16 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 		else
 			return;
 		break;
-	case FIELD_IPV4:
-		if (lc->ipv4_fst == -1)
-			lc->ipv4_fst = idx;
-		else if (lc->ipv4_snd == -1)
-			lc->ipv4_snd = idx;
-		else
+	case FIELD_IPADDR:
+		if (lc->ip1 == -1) {
+			lc->ip1 = idx;
+			if (strstr(lc->sfields, "ip1") != NULL)
+				is_session = 1;
+		} else if (lc->ip2 == -1) {
+			lc->ip2 = idx;
+			if (strstr(lc->sfields, "ip2") != NULL)
+				is_session = 1;
+		} else
 			return;
 		break;
 	case FIELD_REQUEST:
@@ -336,9 +462,11 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 			return;
 		break;
 	case FIELD_USERAGENT:
-		if (lc->useragent == -1)
+		if (lc->useragent == -1) {
 			lc->useragent = idx;
-		else
+			if (strstr(lc->sfields, "useragent") != NULL)
+				is_session = 1;
+		} else
 			return;
 		break;
 	default:
@@ -346,8 +474,9 @@ amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
 	}
 
 	lc->indices[lc->nfields] = (struct field_idx){
-		.type = ftype,
-		.i    = idx
+		.type       = ftype,
+		.i          = idx,
+		.is_session = is_session
 	};
 	lc->nfields++;
 }
@@ -357,8 +486,8 @@ check_line_config(struct line_config *lc)
 {
 	if (lc->ts_rfc3339 == -1)
 		warnx("warning: timestamp field not found");
-	if (lc->ipv4_fst == -1 || lc->ipv4_snd == -1)
-		warnx("warning: source and/or destination address fields not found");
+	if (lc->ip1 == -1 || lc->ip2 == -1)
+		warnx("warning: source and/or destination IP address fields not found");
 	if (lc->request == -1)
 		errx(1, "error: request field not found");
 	if (lc->useragent == -1)
@@ -376,8 +505,8 @@ uint64_t
 ts_rfc3339_to_ms(const char *s)
 {
 	const char ctoi[256] = {
-	    ['1'] = 1,  ['2'] = 2, ['3'] = 3, ['4'] = 4, ['5'] = 5,
-	    ['6'] = 6,  ['7'] = 7, ['8'] = 8, ['9'] = 9
+	    ['0'] = 0, ['1'] = 1, ['2'] = 2, ['3'] = 3, ['4'] = 4,
+	    ['5'] = 5, ['6'] = 6, ['7'] = 7, ['8'] = 8, ['9'] = 9
 	};
 
 	uint64_t year = (ctoi[(int)s[0]] * 1000
@@ -416,6 +545,14 @@ ts_rfc3339_to_ms(const char *s)
 	     + ms;
 }
 
+/*
+ * We use the FNV-1a hash algorithm for constructing session IDs
+ * due to its simplicity.
+ *
+ * http://www.isthe.com/chongo/tech/comp/fnv/
+ *
+ * TODO: use GCC optimization with shifts
+ */
 #define FNV_PRIME64 1099511628211ULL
 #define FNV_BASIS64 14695981039346656037ULL
 uint64_t
@@ -456,7 +593,6 @@ run_thread(void *ctx)
 		if (nfields != lc->ntotal_fields)
 			continue;
 
-
 		uint64_t ts;
 		uint64_t sid = hash64_init();
 		uint64_t rid;
@@ -466,25 +602,29 @@ run_thread(void *ctx)
 			struct field_idx *fidx = &lc->indices[i];
 			struct field_view *fv = &fvs[fidx->i];
 
-			switch (fidx->type) {
-			case FIELD_TS_RFC3339:
-				ts = ts_rfc3339_to_ms(fv->src);
-				//printf("timestamp: %" PRIu64 "\n", ts);
-				break;
-			case FIELD_IPV4:
+			if (fidx->is_session)
 				sid = hash64_update(sid, fv->src, fv->len);
-				//printf("ipv4: %.*s\n", fv->len, fv->src);
-				break;
-			case FIELD_REQUEST:
-				//printf("request: %.*s\n", fv->len, fv->src);
-				break;
-			case FIELD_USERAGENT:
-				sid = hash64_update(sid, fv->src, fv->len);
-				//printf("useragent: %.*s\n", fv->len, fv->src);
-				break;
-			default:
-				break;
-			}
+
+			//switch (fidx->type) {
+			//case FIELD_TS_RFC3339:
+			//	ts = ts_rfc3339_to_ms(fv->src);
+			//	//printf("%.*s -> %" PRIu64 "\n", fv->len, fv->src, ts);
+			//	//printf("timestamp: %" PRIu64 "\n", ts);
+			//	break;
+			//case FIELD_IPADDR:
+			//	sid = hash64_update(sid, fv->src, fv->len);
+			//	//printf("ipv4: %.*s\n", fv->len, fv->src);
+			//	break;
+			//case FIELD_REQUEST:
+			//	//printf("request: %.*s\n", fv->len, fv->src);
+			//	break;
+			//case FIELD_USERAGENT:
+			//	sid = hash64_update(sid, fv->src, fv->len);
+			//	//printf("useragent: %.*s\n", fv->len, fv->src);
+			//	break;
+			//default:
+			//	break;
+			//}
 
 			res->fields_iterated++;
 		}
@@ -501,7 +641,7 @@ run_thread(void *ctx)
 
 void
 init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
-		 struct re_info *re_info)
+		 struct re_info *re_info, const char *session_fields)
 {
 	assert(lc != NULL);
 	assert(log_ctx != NULL);
@@ -512,13 +652,14 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 	memset(lc, 0, sizeof(*lc));
 	*lc = (struct line_config){
 		.ts_rfc3339    = -1,
-		.ipv4_fst      = -1,
-		.ipv4_snd      = -1,
+		.ip1           = -1,
+		.ip2           = -1,
 		.request       = -1,
 		.useragent     = -1,
 
 		.ntotal_fields =  0,
-		.nfields       =  0
+		.nfields       =  0,
+		.sfields       = session_fields
 	};
 
 	struct field_view fvs[NFIELDS_MAX] = {0};
@@ -550,6 +691,8 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 {
 	assert(work_ctx != NULL);
 
+#define MT_THRESHOLD (4 * 1024 * 1024)
+	/* If log size is under MT_THRESHOLD, we use 1 thread. */
 	if (log_ctx->len < MT_THRESHOLD)
 		nthreads = 1;
 	else if (nthreads == -1) {
@@ -629,11 +772,32 @@ cleanup_log_ctx(struct log_ctx *log_ctx)
 		warn("munmap");
 }
 
+void
+validate_session_fields(const char *session_fields)
+{
+	char buf[64] = {0};
+	int ncopy = MIN(strlen(session_fields), sizeof(buf) - 1);
+	memcpy(buf, session_fields, ncopy);
+	char *s = buf;
+	char *endp = s;
+	while ((s = strtok(endp, ",")) != NULL) {
+		endp = NULL;
+		if (strcmp(s, "ip1") == 0)
+			continue;
+		if (strcmp(s, "ip2") == 0)
+			continue;
+		if (strcmp(s, "useragent") == 0)
+			continue;
+		errx(1, "error: invalid session field: %s\n", s);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
 	//char *ignore_patterns = NULL;
 	//char *merge_patterns  = NULL;
+	const char *session_fields = "ip1,useragent";
 	long nthreads = -1;
 
 	struct log_ctx log_ctx;
@@ -647,12 +811,13 @@ main(int argc, char **argv)
 			{"help",            no_argument,       0, 'h' },
 			{"ignore-patterns", required_argument, 0, 'I' },
 			{"merge-patterns",  required_argument, 0, 'M' },
+			{"session",         required_argument, 0, 'S' },
 			{"threads",         required_argument, 0, 'T' },
 			{"version",         no_argument,       0, 'V' },
 			{0,                 0,                 0,  0  }
 		};
 
-		int c = getopt_long(argc, argv, "hI:M:T:V", long_opts, &opt_idx);
+		int c = getopt_long(argc, argv, "hI:M:S:T:V", long_opts, &opt_idx);
 		if (c == -1)
 			break;
 
@@ -675,7 +840,10 @@ main(int argc, char **argv)
 		case 'M':
 			//merge_patterns = optarg;
 			break;
-
+		case 'S':
+			session_fields = optarg;
+			validate_session_fields(session_fields);
+			break;
 		case 'T':
 			nthreads = strtol(optarg, NULL, 10);
 			if (nthreads == 0
@@ -702,7 +870,7 @@ main(int argc, char **argv)
 
 	init_log_ctx(&log_ctx, argv[0]);
 	init_re_info(&re_info);
-	init_line_config(&lc, &log_ctx, &re_info);
+	init_line_config(&lc, &log_ctx, &re_info, session_fields);
 	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc);
 
 	cleanup_work_ctx(&work_ctx);
@@ -717,7 +885,7 @@ usage(void)
 {
 	fprintf(stderr,
 "apathy %s\n"
-"Access Log Path Analyzer\n"
+"Access log path analyzer\n"
 "\n"
 "    apathy [OPTIONS] <ACCESS_LOG>\n"
 "\n"
@@ -728,6 +896,13 @@ usage(void)
 "OPTIONS:\n"
 "    -I, --ignore-patterns <pattern_file>    File containing URL patterns for ignoring HTTP requests\n"
 "    -M, --merge-patterns <pattern_file>     File containing URL patterns for merging HTTP requests\n"
+"\n"
+"    -S, --session <session_fields>          Comma-separated fields used to construct a session ID for a request\n"
+"                                            Available fields: ip1,ip2,useragent\n"
+"                                            Default: ip1,useragent\n"
+"\n"
+"    -T, --threads <num_threads>             Number of worker threads\n"
+"                                            Default: number of logical CPU cores, or 4 as a fallback\n"
 "\n"
 "ARGUMENTS:\n"
 "    <ACCESS_LOG>    Access log file containing HTTP request timestamps, IP addresses, methods, URLs and User Agent headers\n",
