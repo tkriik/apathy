@@ -1,8 +1,9 @@
 # Custom
 apathy
-test.log
 tags
 callgrind.*
+cachegrind.*
+local/
 
 # Prerequisites
 *.d

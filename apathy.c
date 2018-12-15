@@ -64,6 +64,8 @@
  *    4.2 A truncated copy of the request field, with only method and URL,
  *        is stored in a hash table, for avoiding duplicate storage for
  *        identical requests.
+ *
+ *    4.3 TODO
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -144,22 +146,38 @@ struct line_config {
 	const char *sfields;
 };
 
-/* Unique request data, stored in a hash table. */
-struct request_entry {
-	char           *data;
-	UT_hash_handle  hh;
-};
-
-struct request_table {
-	struct request_entry *handle;
-	pthread_rwlock_t      lock;
-};
-
 /* Working area for one thread. */
 struct thread_chunk {
 	size_t      size;
 	const char *start;
 	const char *end;   /* start + size bytes */
+};
+
+/* Request-specific info, stored in a hash table. */
+struct request_entry {
+	char *data;
+	UT_hash_handle hh;
+};
+
+struct request_table {
+	struct request_entry *handle;
+	pthread_spinlock_t    lock;
+};
+
+/* Session-specific information, stored in a hash table. */
+struct session_entry {
+#define MAX_DEPTH 16
+	uint64_t  sid;                   /* Session ID */
+	int       nrequests;             /* Number of requests */
+	uint64_t  timestamps[MAX_DEPTH]; /* Request timestamps */
+	char     *requests[MAX_DEPTH];   /* Request fields */
+	uint64_t  repeats[MAX_DEPTH];    /* Repeats per request */
+	UT_hash_handle hh;
+};
+
+struct session_table {
+	struct session_entry *handle;
+	pthread_spinlock_t    lock;
 };
 
 /* Thread-specific context. */
@@ -170,6 +188,7 @@ struct thread_ctx {
 	struct line_config *line_config;
 	struct thread_chunk chunk;
 	struct request_table *request_table;
+	struct session_table *session_table;
 };
 
 /*
@@ -210,6 +229,7 @@ struct field_view {
 };
 
 void debug_request_table(struct request_table *);
+void debug_session_table(struct session_table *);
 void usage(void);
 
 void *
@@ -422,8 +442,6 @@ infer_field_type(struct field_view *fv, struct re_info *re_info)
 	if (regex_does_match(&re_info->useragent, field))
 		return FIELD_USERAGENT;
 
-	// TODO: useragent
-
 	return FIELD_UNKNOWN;
 }
 
@@ -575,10 +593,10 @@ hash64_update(uint64_t hash, const char *s, size_t len)
 
 /*
  * Stores a request field pointed to by src into the request table rt.
- * Returns a pointer to either a newly allocated string, or an existing
- * string, if an identical request field has been stored in the table already.
+ * Returns a pointer to a unique request field contained in a newly created,
+ * or existing, request entry.
  */
-const char *
+char *
 set_request_entry(const char *src, struct request_table *rt)
 {
 	assert(src != NULL);
@@ -611,43 +629,110 @@ set_request_entry(const char *src, struct request_table *rt)
 		}
 	}
 
-	struct request_entry *req = NULL;
+	struct request_entry *re = NULL;
 effective_req:
 
-	rc = pthread_rwlock_rdlock(&rt->lock);
+	rc = pthread_spin_lock(&rt->lock);
 	if (rc != 0)
-		err(1, "error: pthread_rwlock_rdlock");
+		err(1, "error: pthread_spin_lock");
 
-	HASH_FIND(hh, rt->handle, src, req_len, req);
-	if (req != NULL)
+	HASH_FIND(hh, rt->handle, src, req_len, re);
+	if (re != NULL)
 		goto finish;
 
-	rc = pthread_rwlock_unlock(&rt->lock);
-	if (rc != 0)
-		err(1, "error: pthread_rwlock_unlock");
-
-	req = calloc(1, sizeof(*req));
-	if (req == NULL)
+	re = calloc(1, sizeof(*re));
+	if (re == NULL)
 		err(1, "error: calloc");
 
-	req->data = calloc(1, req_len + 1);
-	if (req->data == NULL)
+	re->data = calloc(1, req_len + 1);
+	if (re->data == NULL)
 		err(1, "error: calloc");
-	memcpy(req->data, src, req_len);
+	memcpy(re->data, src, req_len);
 
-	rc = pthread_rwlock_wrlock(&rt->lock);
-	if (rc != 0)
-		err(1, "error: pthread_rwlock_wrlock");
-
-	HASH_ADD_KEYPTR(hh, rt->handle, req->data, req_len, req);
-	printf("added: %s\n", req->data);
-
+	HASH_ADD_KEYPTR(hh, rt->handle, re->data, req_len, re);
 finish:
-	rc = pthread_rwlock_unlock(&rt->lock);
+	rc = pthread_spin_unlock(&rt->lock);
 	if (rc != 0)
-		err(1, "error: pthread_rwlock_unlock");
+		err(1, "error: pthread_spin_unlock");
 
-	return req->data;
+	return re->data;
+}
+
+/*
+ * Creates or modifies a session entry in the session table, with
+ * session ID sid as the key. Since multiple threads may be editing
+ * the same session entry at different times, the timestamp is used
+ * to keep the session request list in order at each modification.
+ */
+void
+amend_session_entry(struct session_table *st, uint64_t sid, uint64_t ts, char *re_data)
+{
+	assert(st != NULL);
+	assert(re_data != NULL);
+
+	int rc;
+	int i;
+	struct session_entry *se = NULL;
+
+	rc = pthread_spin_lock(&st->lock);
+	if (rc != 0)
+		err(1, "error: pthread_spin_lock");
+
+	HASH_FIND_INT(st->handle, &sid, se);
+	if (se != NULL) {
+		if (se->nrequests == MAX_DEPTH)
+			goto finish;
+		else
+			goto amend;
+	}
+
+	se = calloc(1, sizeof(*se));
+	if (se == NULL)
+		err(1, "error: calloc");
+	se->sid = sid;
+	se->nrequests = 0;
+
+	HASH_ADD_INT(st->handle, sid, se);
+amend:
+	i = se->nrequests;
+	if (i == 0)
+		goto first;
+
+	/* Rewind index to sorted timestamp position. */
+	for (; 0 < i && ts < se->timestamps[i - 1]; i--);
+
+	/*
+	 * Check if request at previous or current index is identical;
+	 * if yes, increment repeat count accordingly.
+	 * */
+	if (se->requests[i - 1] == re_data) {
+		se->repeats[i - 1]++;
+		goto finish;
+	}
+	if (se->requests[i] == re_data) {
+		se->repeats[i]++;
+		goto finish;
+	}
+
+	/* Shift the more recent requests up one index
+	 * to make room for the current request. */
+	int nmove = se->nrequests - i;
+	memmove(&se->timestamps[i + 1], &se->timestamps[i],
+	    nmove * sizeof(se->timestamps[0]));
+	memmove(&se->requests[i + 1], &se->requests[i],
+	    nmove * sizeof(se->requests[0]));
+first:
+	se->requests[i] = re_data;
+	se->timestamps[i] = ts;
+	se->nrequests++;
+finish:
+	for (int i = 1; i < se->nrequests; i++) {
+		if (se->requests[i - 1] == se->requests[i])
+			printf("DUPLICATE\n");
+	}
+	rc = pthread_spin_unlock(&st->lock);
+	if (rc != 0)
+		err(1, "error: pthread_spin_unlock");
 }
 
 void *
@@ -660,6 +745,7 @@ run_thread(void *ctx)
 	const char *src = thread_ctx->chunk.start;
 	struct line_config *lc = thread_ctx->line_config;
 	struct request_table *rt = thread_ctx->request_table;
+	struct session_table *st = thread_ctx->session_table;
 
 	while (1) {
 		if (thread_ctx->chunk.end <= src || src == NULL)
@@ -672,9 +758,9 @@ run_thread(void *ctx)
 		if (nfields != lc->ntotal_fields)
 			continue;
 
-		uint64_t ts;
+		uint64_t ts = 0;
 		uint64_t sid = hash64_init();
-		const char *req_data = NULL;
+		char *re_data = NULL;
 
 		for (int i = 0; i < lc->nfields; i++) {
 			struct field_idx *fidx = &lc->indices[i];
@@ -691,7 +777,7 @@ run_thread(void *ctx)
 				sid = hash64_update(sid, fv->src, fv->len);
 				break;
 			case FIELD_REQUEST:
-				req_data = set_request_entry(fv->src, rt);
+				re_data = set_request_entry(fv->src, rt);
 				break;
 			case FIELD_USERAGENT:
 				sid = hash64_update(sid, fv->src, fv->len);
@@ -701,7 +787,7 @@ run_thread(void *ctx)
 			}
 		}
 
-		//printf("%" PRIu64 " %016" PRIx64 " %s\n", ts, sid, req_data);
+		amend_session_entry(st, sid, ts, re_data);
 	} 
 
 	pthread_exit(NULL);
@@ -747,17 +833,30 @@ void
 init_request_table(struct request_table *rt)
 {
 	rt->handle = NULL;
-
-	int rc = pthread_rwlock_init(&rt->lock, NULL);
+	int rc = pthread_spin_init(&rt->lock, PTHREAD_PROCESS_PRIVATE);
 	if (rc != 0)
-		err(1, "error: pthread_rwlock_init");
+		err(1, "error: pthread_spin_init");
+}
+
+void
+init_session_table(struct session_table *st)
+{
+	st->handle = NULL;
+	int rc = pthread_spin_init(&st->lock, PTHREAD_PROCESS_PRIVATE);
+	if (rc != 0)
+		err(1, "error: pthread_spin_init");
 }
 
 void
 init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
-              struct line_config *lc, struct request_table *rt)
+              struct line_config *lc, struct request_table *rt,
+	      struct session_table *st)
 {
 	assert(work_ctx != NULL);
+	assert(log_ctx != NULL);
+	assert(lc != NULL);
+	assert(rt != NULL);
+	assert(st != NULL);
 
 	int rc;
 
@@ -803,6 +902,7 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 		thread_ctx->chunk.end     = log_ctx->src + end_offset;
 		thread_ctx->chunk.size    = end_offset - start_offset;
 		thread_ctx->request_table = rt;
+		thread_ctx->session_table = st;
 
 		rc = pthread_create(&work_ctx->thread[tid], NULL, run_thread,
 		                    (void *)thread_ctx);
@@ -830,6 +930,22 @@ cleanup_request_table(struct request_table *rt)
 		free(r->data);
 		free(r);
 	}
+	int rc = pthread_spin_destroy(&rt->lock);
+	if (rc != 0)
+		warn("warning: pthread_spin_destroy");
+}
+
+void
+cleanup_session_table(struct session_table *st)
+{
+	struct session_entry *s, *tmp;
+	HASH_ITER(hh, st->handle, s, tmp) {
+		HASH_DEL(st->handle, s);
+		free(s);
+	}
+	int rc = pthread_spin_destroy(&st->lock);
+	if (rc != 0)
+		warn("warning: pthread_spin_destroy");
 }
 
 void
@@ -882,6 +998,7 @@ main(int argc, char **argv)
 	struct re_info re_info;
 	struct line_config lc;
 	struct request_table rt;
+	struct session_table st;
 	struct work_ctx work_ctx;
 
 	while (1) {
@@ -944,11 +1061,16 @@ main(int argc, char **argv)
 	init_re_info(&re_info);
 	init_line_config(&lc, &log_ctx, &re_info, session_fields);
 	init_request_table(&rt);
-	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc, &rt);
+	init_session_table(&st);
+	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc, &rt, &st);
 
 	cleanup_work_ctx(&work_ctx);
-	debug_request_table(&rt);
+
+	//debug_request_table(&rt);
+	debug_session_table(&st);
+
 	cleanup_request_table(&rt);
+	cleanup_session_table(&st);
 	cleanup_re_info(&re_info);
 	cleanup_log_ctx(&log_ctx);
 
@@ -992,4 +1114,20 @@ debug_request_table(struct request_table *rt)
 	HASH_ITER(hh, rt->handle, r, tmp) {
 		printf("%p %s\n", r->data, r->data);
 	}
+}
+
+void
+debug_session_table(struct session_table *st)
+{
+	struct session_entry *se, *tmp;
+	printf("----- BEGIN SESSION TABLE -----\n");
+	HASH_ITER(hh, st->handle, se, tmp) {
+		printf("%016" PRIx64 ":\n", se->sid);
+		for (int i = 0; i < se->nrequests; i++) {
+			printf("  %" PRIu64 " %p %s (%"PRIu64" repeats)\n",
+			       se->timestamps[i] / 1000, se->requests[i],
+                               se->requests[i], se->repeats[i]);
+		}
+	}
+	printf("----- END SESSION TABLE -----\n");
 }

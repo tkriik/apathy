@@ -9,7 +9,7 @@ CFLAGS=		-std=c99 \
 		-Wno-unused-variable \
 		-Wno-unused-but-set-variable \
 		-D_DEFAULT_SOURCE \
-		-g \
+		-g3 \
 		-O2
 
 CFLAGS_RELEASE=	-std=c99 \
