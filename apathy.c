@@ -118,7 +118,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "uthash.h"
+#include "lib/uthash.h"
 
 #define VERSION "0.1.0"
 
