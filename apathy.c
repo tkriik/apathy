@@ -230,7 +230,7 @@ struct thread_ctx {
  * These patterns are deliberately liberal, since we don't use them in
  * any strict way.
  */
-struct re_info {
+struct regex_info {
 #define RFC3339_PATTERN   "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
 #define IPV4_PATTERN      "[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
 #define REQUEST_PATTERN   "(GET|HEAD|POST|PUT|OPTIONS|PATCH)\\s+(http|https)://.+"
@@ -440,14 +440,14 @@ init_log_ctx(struct log_ctx *ctx, const char *path)
 }
 
 void
-init_re_info(struct re_info *re_info)
+init_regex_info(struct regex_info *rx_info)
 {
-	assert(re_info != NULL);
+	assert(rx_info != NULL);
 
-	compile_regex(&re_info->rfc3339, RFC3339_PATTERN);
-	compile_regex(&re_info->ipv4, IPV4_PATTERN);
-	compile_regex(&re_info->request, REQUEST_PATTERN);
-	compile_regex(&re_info->useragent, USERAGENT_PATTERN);
+	compile_regex(&rx_info->rfc3339, RFC3339_PATTERN);
+	compile_regex(&rx_info->ipv4, IPV4_PATTERN);
+	compile_regex(&rx_info->request, REQUEST_PATTERN);
+	compile_regex(&rx_info->useragent, USERAGENT_PATTERN);
 }
 
 int
@@ -458,23 +458,23 @@ regex_does_match(regex_t *preg, const char *s)
 }
 
 enum field_type
-infer_field_type(struct field_view *fv, struct re_info *re_info)
+infer_field_type(struct field_view *fv, struct regex_info *rx_info)
 {
 #define FIELD_MAX 4096
 	char field[FIELD_MAX + 1] = {0};
 	int ncopy = MIN(fv->len, FIELD_MAX);
 	memcpy(field, fv->src, ncopy);
 
-	if (regex_does_match(&re_info->rfc3339, field))
+	if (regex_does_match(&rx_info->rfc3339, field))
 		return FIELD_TS_RFC3339;
 
-	if (regex_does_match(&re_info->ipv4, field))
+	if (regex_does_match(&rx_info->ipv4, field))
 		return FIELD_IPADDR;
 
-	if (regex_does_match(&re_info->request, field))
+	if (regex_does_match(&rx_info->request, field))
 		return FIELD_REQUEST;
 
-	if (regex_does_match(&re_info->useragent, field))
+	if (regex_does_match(&rx_info->useragent, field))
 		return FIELD_USERAGENT;
 
 	return FIELD_UNKNOWN;
@@ -857,11 +857,11 @@ run_thread(void *ctx)
 
 void
 init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
-		 struct re_info *re_info, const char *session_fields)
+		 struct regex_info *rx_info, const char *session_fields)
 {
 	assert(lc != NULL);
 	assert(log_ctx != NULL);
-	assert(re_info != NULL);
+	assert(rx_info != NULL);
 
 	const char *src = log_ctx->src;
 
@@ -884,7 +884,7 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 	lc->ntotal_fields = nfields;
 	for (int i = 0; i < nfields; i++) {
 		struct field_view *fv = &fvs[i];
-		enum field_type ftype = infer_field_type(fv, re_info);
+		enum field_type ftype = infer_field_type(fv, rx_info);
 		amend_line_config(lc, ftype, i);
 	}
 	
@@ -1016,14 +1016,14 @@ cleanup_session_table(struct session_table *st)
 }
 
 void
-cleanup_re_info(struct re_info *re_info)
+cleanup_regex_info(struct regex_info *rx_info)
 {
-	assert(re_info != NULL);
+	assert(rx_info != NULL);
 
-	regfree(&re_info->rfc3339);
-	regfree(&re_info->ipv4);
-	regfree(&re_info->request);
-	regfree(&re_info->useragent);
+	regfree(&rx_info->rfc3339);
+	regfree(&rx_info->ipv4);
+	regfree(&rx_info->request);
+	regfree(&rx_info->useragent);
 }
 
 void
@@ -1062,7 +1062,7 @@ main(int argc, char **argv)
 	long nthreads = -1;
 
 	struct log_ctx log_ctx;
-	struct re_info re_info;
+	struct regex_info rx_info;
 	struct line_config lc;
 	struct request_table rt;
 	struct session_table st;
@@ -1125,8 +1125,8 @@ main(int argc, char **argv)
 		errx(1, "only one access log allowed");
 
 	init_log_ctx(&log_ctx, argv[0]);
-	init_re_info(&re_info);
-	init_line_config(&lc, &log_ctx, &re_info, session_fields);
+	init_regex_info(&rx_info);
+	init_line_config(&lc, &log_ctx, &rx_info, session_fields);
 	init_request_table(&rt);
 	init_session_table(&st);
 
@@ -1141,7 +1141,7 @@ main(int argc, char **argv)
 
 	cleanup_request_table(&rt);
 	cleanup_session_table(&st);
-	cleanup_re_info(&re_info);
+	cleanup_regex_info(&rx_info);
 	cleanup_log_ctx(&log_ctx);
 
 	return 0;
