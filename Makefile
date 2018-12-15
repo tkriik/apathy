@@ -33,6 +33,9 @@ all: $(BIN)
 $(BIN): $(SRC)
 	$(CC) $(CFLAGS) -o $(BIN) $(SRC) $(LDFLAGS)
 
+profile: LDFLAGS += -lprofiler
+profile: $(BIN)
+
 release: CFLAGS = $(CFLAGS_RELEASE)
 release: $(BIN)
 

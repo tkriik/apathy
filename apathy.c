@@ -726,10 +726,6 @@ first:
 	se->timestamps[i] = ts;
 	se->nrequests++;
 finish:
-	for (int i = 1; i < se->nrequests; i++) {
-		if (se->requests[i - 1] == se->requests[i])
-			printf("DUPLICATE\n");
-	}
 	rc = pthread_spin_unlock(&st->lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_unlock");
@@ -1067,7 +1063,7 @@ main(int argc, char **argv)
 	cleanup_work_ctx(&work_ctx);
 
 	//debug_request_table(&rt);
-	debug_session_table(&st);
+	//debug_session_table(&st);
 
 	cleanup_request_table(&rt);
 	cleanup_session_table(&st);
