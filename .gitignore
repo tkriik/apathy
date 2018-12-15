@@ -4,6 +4,7 @@ tags
 callgrind.*
 cachegrind.*
 local/
+cpu_profile
 
 # Prerequisites
 *.d

@@ -23,12 +23,16 @@
  */
 
 /*
- * How this program works:
+ * HOW THIS PROGRAM WORKS:
+ *
+ * -----------------------------------------------------------------------------
  *
  * 1. We map the log file into memory, so that multiple gigabyte sized
  *    log files pose no issues.
  *
  *    - init_log_ctx()
+ *
+ * -----------------------------------------------------------------------------
  *
  * 2. We look at the first line to infer indices of fields relevant to us,
  *    such as timestamp, IP addresses, request info (method + URL)
@@ -36,11 +40,19 @@
  *
  *    - init_line_config()
  *
+ * -----------------------------------------------------------------------------
+ *
  * 3. We split the memory area into N chunks, where N is the number of threads
  *    available. By default, we use the number of logical CPU cores as
  *    the thread count.
+ *    After the chunks have been divided, we start N worker threads,
+ *    each with a context (struct thread_ctx) containing pointers to shared
+ *    data, such as log information, line configuration, request and session
+ *    tables etc.
  *
  *    - init_work_ctx()
+ *
+ * -----------------------------------------------------------------------------
  *
  * 4. Each threads scans their respective chunks for lines, from which
  *    they split the line into fields delimited by spaces or double quotes.
@@ -61,11 +73,30 @@
  *         IP address (whichever is the source address) plus the user agent,
  *         for more accuracy. This is the default mode.
  *
+ *    --------------------------------------------------------------------------
+ *
  *    4.2 A truncated copy of the request field, with only method and URL,
  *        is stored in a hash table, for avoiding duplicate storage for
  *        identical requests.
+ *        There are multiple hash tables (REQUEST_TABLE_NBUCKETS),
+ *        each with separate locks, in order to reduce lock contention
+ *        across multiple threads.
  *
- *    4.3 TODO
+ *          - set_request_entry()
+ *
+ *    --------------------------------------------------------------------------
+ *
+ *    4.3 A pointer to the copied request field is then added to the
+ *        session entry pointed to by sid, unless it does not exist, in which
+ *        case it is created. The request is sorted according to its timestamp,
+ *        since they may arrive in different order, and it will not be merged
+ *        to the session entry if it is a repeated request, in which case
+ *        only the repeat count for that request is incremented.
+ *        As with request table, there are
+ *        multiple hash tables (SESSION_TABLE_NBUCKETS) for session entries,
+ *        each with separate locks.
+ *
+ *          - amend_session_entry()
  */
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -159,9 +190,11 @@ struct request_entry {
 	UT_hash_handle hh;
 };
 
+#define REQUEST_TABLE_NBUCKETS    (1 << 8)
+#define REQUEST_TABLE_BUCKET_MASK (REQUEST_TABLE_NBUCKETS - 1)
 struct request_table {
-	struct request_entry *handle;
-	pthread_spinlock_t    lock;
+	struct request_entry *handles[REQUEST_TABLE_NBUCKETS];
+	pthread_spinlock_t    locks[REQUEST_TABLE_NBUCKETS];
 };
 
 /* Session-specific information, stored in a hash table. */
@@ -175,9 +208,11 @@ struct session_entry {
 	UT_hash_handle hh;
 };
 
+#define SESSION_TABLE_NBUCKETS    (1 << 16)
+#define SESSION_TABLE_BUCKET_MASK (SESSION_TABLE_NBUCKETS - 1)
 struct session_table {
-	struct session_entry *handle;
-	pthread_spinlock_t    lock;
+	struct session_entry *handles[SESSION_TABLE_NBUCKETS];
+	pthread_spinlock_t    locks[SESSION_TABLE_NBUCKETS];
 };
 
 /* Thread-specific context. */
@@ -591,6 +626,12 @@ hash64_update(uint64_t hash, const char *s, size_t len)
 	return hash;
 }
 
+uint64_t
+hash64_update_char(uint64_t hash, char c)
+{
+	return (hash ^ c) * FNV_PRIME64;
+}
+
 /*
  * Stores a request field pointed to by src into the request table rt.
  * Returns a pointer to a unique request field contained in a newly created,
@@ -600,6 +641,11 @@ char *
 set_request_entry(const char *src, struct request_table *rt)
 {
 	assert(src != NULL);
+
+	size_t bucket_idx = hash64_init();
+	struct request_entry **handlep;
+	pthread_spinlock_t *lock;
+	struct request_entry *re;
 
 	int rc;
 	const char *s = src;
@@ -624,19 +670,23 @@ set_request_entry(const char *src, struct request_table *rt)
 			/* NOTREACHED */
 			break;
 		default:
+			bucket_idx = hash64_update_char(bucket_idx, c);
 			req_len++;
 			break;
 		}
 	}
 
-	struct request_entry *re = NULL;
 effective_req:
+	bucket_idx &= REQUEST_TABLE_BUCKET_MASK;
+	handlep = &rt->handles[bucket_idx];
+	lock = &rt->locks[bucket_idx];
+	re = NULL;
 
-	rc = pthread_spin_lock(&rt->lock);
+	rc = pthread_spin_lock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_lock");
 
-	HASH_FIND(hh, rt->handle, src, req_len, re);
+	HASH_FIND(hh, *handlep, src, req_len, re);
 	if (re != NULL)
 		goto finish;
 
@@ -649,9 +699,9 @@ effective_req:
 		err(1, "error: calloc");
 	memcpy(re->data, src, req_len);
 
-	HASH_ADD_KEYPTR(hh, rt->handle, re->data, req_len, re);
+	HASH_ADD_KEYPTR(hh, *handlep, re->data, req_len, re);
 finish:
-	rc = pthread_spin_unlock(&rt->lock);
+	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_unlock");
 
@@ -674,12 +724,22 @@ amend_session_entry(struct session_table *st, uint64_t sid, uint64_t ts, char *r
 	int i;
 	struct session_entry *se = NULL;
 
-	rc = pthread_spin_lock(&st->lock);
+	/* TODO: more event bucket indexing */
+	size_t bucket_idx = hash64_init();
+	bucket_idx = hash64_update(bucket_idx, (void *)&sid, sizeof(sid));
+	bucket_idx &= SESSION_TABLE_BUCKET_MASK;
+	/* We have to use pointer to a pointer, otherwise the uthash
+	 * macros don't work as intended.  */
+	struct session_entry **handlep = &st->handles[bucket_idx];
+	pthread_spinlock_t *lock = &st->locks[bucket_idx];
+
+	rc = pthread_spin_lock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_lock");
 
-	HASH_FIND_INT(st->handle, &sid, se);
+	HASH_FIND_INT(*handlep, &sid, se);
 	if (se != NULL) {
+		//printf("found sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
 		if (se->nrequests == MAX_DEPTH)
 			goto finish;
 		else
@@ -692,7 +752,13 @@ amend_session_entry(struct session_table *st, uint64_t sid, uint64_t ts, char *r
 	se->sid = sid;
 	se->nrequests = 0;
 
-	HASH_ADD_INT(st->handle, sid, se);
+	HASH_ADD_INT(*handlep, sid, se);
+	//printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
+	//struct session_entry *tmp_se;
+	//HASH_FIND_INT(handle, &sid, tmp_se);
+	//if (tmp_se != NULL) {
+	//	printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
+	//}
 amend:
 	i = se->nrequests;
 	if (i == 0)
@@ -726,7 +792,7 @@ first:
 	se->timestamps[i] = ts;
 	se->nrequests++;
 finish:
-	rc = pthread_spin_unlock(&st->lock);
+	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_unlock");
 }
@@ -828,19 +894,21 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 void
 init_request_table(struct request_table *rt)
 {
-	rt->handle = NULL;
-	int rc = pthread_spin_init(&rt->lock, PTHREAD_PROCESS_PRIVATE);
-	if (rc != 0)
-		err(1, "error: pthread_spin_init");
+	for (size_t i = 0; i< REQUEST_TABLE_NBUCKETS; i++) {
+		rt->handles[i] = NULL;
+		if (pthread_spin_init(&rt->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
+			err(1, "error: pthread_spin_init");
+	}
 }
 
 void
 init_session_table(struct session_table *st)
 {
-	st->handle = NULL;
-	int rc = pthread_spin_init(&st->lock, PTHREAD_PROCESS_PRIVATE);
-	if (rc != 0)
-		err(1, "error: pthread_spin_init");
+	for (size_t i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
+		st->handles[i] = NULL;
+		if (pthread_spin_init(&st->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
+			err(1, "error: pthread_spin_init");
+	}
 }
 
 void
@@ -920,28 +988,31 @@ cleanup_work_ctx(struct work_ctx *work_ctx)
 void
 cleanup_request_table(struct request_table *rt)
 {
-	struct request_entry *r, *tmp;
-	HASH_ITER(hh, rt->handle, r, tmp) {
-		HASH_DEL(rt->handle, r);
-		free(r->data);
-		free(r);
+	for (size_t i = 0; i < REQUEST_TABLE_NBUCKETS; i++) {
+		struct request_entry *r, *tmp;
+		HASH_ITER(hh, rt->handles[i], r, tmp) {
+			HASH_DEL(rt->handles[i], r);
+			free(r->data);
+			free(r);
+		}
+		if (pthread_spin_destroy(&rt->locks[i]) != 0)
+			warn("warning: pthread_spin_destroy");
 	}
-	int rc = pthread_spin_destroy(&rt->lock);
-	if (rc != 0)
-		warn("warning: pthread_spin_destroy");
 }
 
 void
 cleanup_session_table(struct session_table *st)
 {
-	struct session_entry *s, *tmp;
-	HASH_ITER(hh, st->handle, s, tmp) {
-		HASH_DEL(st->handle, s);
-		free(s);
+	for (int i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
+		struct session_entry *s, *tmp;
+		HASH_ITER(hh, st->handles[i], s, tmp) {
+			HASH_DEL(st->handles[i], s);
+			free(s);
+		}
+		int rc = pthread_spin_destroy(&st->locks[i]);
+		if (rc != 0)
+			warn("warning: pthread_spin_destroy");
 	}
-	int rc = pthread_spin_destroy(&st->lock);
-	if (rc != 0)
-		warn("warning: pthread_spin_destroy");
 }
 
 void
@@ -1058,8 +1129,11 @@ main(int argc, char **argv)
 	init_line_config(&lc, &log_ctx, &re_info, session_fields);
 	init_request_table(&rt);
 	init_session_table(&st);
+
+	/* Start worker threads */
 	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc, &rt, &st);
 
+	/* Wait for worker threads to finish */
 	cleanup_work_ctx(&work_ctx);
 
 	//debug_request_table(&rt);
@@ -1106,24 +1180,61 @@ usage(void)
 void
 debug_request_table(struct request_table *rt)
 {
-	struct request_entry *r, *tmp;
-	HASH_ITER(hh, rt->handle, r, tmp) {
-		printf("%p %s\n", r->data, r->data);
+	printf("----- BEGIN REQUEST TABLE -----\n");
+	uint64_t min_bucket_count = HASH_COUNT(rt->handles[0]);
+	uint64_t max_bucket_count = HASH_COUNT(rt->handles[0]);
+	uint64_t total_count = 0;
+	for (size_t i = 1; i < REQUEST_TABLE_NBUCKETS; i++) {
+		size_t bucket_count = HASH_COUNT(rt->handles[i]);
+		total_count += bucket_count;
+		if (bucket_count < min_bucket_count)
+			min_bucket_count = bucket_count;
+		if (max_bucket_count < bucket_count)
+			max_bucket_count = bucket_count;
 	}
+	printf("min_bucket_count: %" PRIu64 "\n", min_bucket_count);
+	printf("max_bucket_count: %" PRIu64 "\n", max_bucket_count);
+	printf("avg_bucket_count: %lf\n", (double)total_count / REQUEST_TABLE_NBUCKETS);
+	printf("total_count: %" PRIu64 "\n", total_count);
+	//for (size_t i = 0; i < REQUEST_TABLE_NBUCKETS; i++) {
+	//	struct request_entry *r, *tmp;
+	//	HASH_ITER(hh, rt->handles[i], r, tmp) {
+	//		printf("%p %s\n", r->data, r->data);
+	//	}
+	//}
+	printf("----- END REQUEST TABLE -----\n");
 }
 
 void
 debug_session_table(struct session_table *st)
 {
-	struct session_entry *se, *tmp;
 	printf("----- BEGIN SESSION TABLE -----\n");
-	HASH_ITER(hh, st->handle, se, tmp) {
-		printf("%016" PRIx64 ":\n", se->sid);
-		for (int i = 0; i < se->nrequests; i++) {
-			printf("  %" PRIu64 " %p %s (%"PRIu64" repeats)\n",
-			       se->timestamps[i] / 1000, se->requests[i],
-                               se->requests[i], se->repeats[i]);
-		}
+	uint64_t min_bucket_count = HASH_COUNT(st->handles[0]);
+	uint64_t max_bucket_count = HASH_COUNT(st->handles[0]);
+	uint64_t total_count = 0;
+	for (size_t i = 1; i < SESSION_TABLE_NBUCKETS; i++) {
+		size_t bucket_count = HASH_COUNT(st->handles[i]);
+		total_count += bucket_count;
+		if (bucket_count < min_bucket_count)
+			min_bucket_count = bucket_count;
+		if (max_bucket_count < bucket_count)
+			max_bucket_count = bucket_count;
 	}
+	printf("min_bucket_count: %" PRIu64 "\n", min_bucket_count);
+	printf("max_bucket_count: %" PRIu64 "\n", max_bucket_count);
+	printf("avg_bucket_count: %lf\n", (double)total_count / SESSION_TABLE_NBUCKETS);
+	printf("total_count: %" PRIu64 "\n", total_count);
+	//for (int i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
+	//	struct session_entry *se, *tmp;
+	//	HASH_ITER(hh, st->handles[i], se, tmp) {
+	//		printf("%016" PRIx64 ":\n", se->sid);
+	//		for (int i = 0; i < se->nrequests; i++) {
+	//			printf("    %" PRIu64 " %p %s (%"PRIu64" repeats)\n",
+	//			       se->timestamps[i] / 1000, se->requests[i],
+        //	                       se->requests[i], se->repeats[i]);
+	//		}
+	//	}
+	//	printf("\n");
+	//}
 	printf("----- END SESSION TABLE -----\n");
 }
