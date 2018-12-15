@@ -201,7 +201,7 @@ struct request_table {
 struct session_entry {
 #define MAX_DEPTH 16
 	uint64_t  sid;                   /* Session ID */
-	int       nrequests;             /* Number of requests */
+	int       nrequests;             /* Number of requests in session */
 	uint64_t  timestamps[MAX_DEPTH]; /* Request timestamps */
 	char     *requests[MAX_DEPTH];   /* Request fields */
 	uint64_t  repeats[MAX_DEPTH];    /* Repeats per request */
@@ -213,6 +213,21 @@ struct session_entry {
 struct session_table {
 	struct session_entry *handles[SESSION_TABLE_NBUCKETS];
 	pthread_spinlock_t    locks[SESSION_TABLE_NBUCKETS];
+};
+
+/* Aggregated path information. */
+struct path_entry {
+	size_t   nrequests;           /* Number of requests */
+	uint64_t total_hits;          /* Total path hits */
+	char    *requests[MAX_DEPTH]; /* Request fields */
+	uint64_t hits[MAX_DEPTH];     /* Total hits up until each request */
+	/* TODO: average pauses, repeats */
+};
+
+struct path_list {
+	size_t total_npaths;
+	size_t common_npaths;
+	struct path_entry *paths;
 };
 
 /* Thread-specific context. */
@@ -975,6 +990,137 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 	}
 }
 
+int
+cmp_path_entries_by_request_order(const void *p1, const void *p2)
+{
+	const struct path_entry *pe1 = p1;
+	const struct path_entry *pe2 = p2;
+	size_t ncmp = sizeof(pe1->requests) * sizeof(pe1->requests[0]);
+	return -(memcmp(pe1->requests, pe2->requests, ncmp));
+}
+
+/* Returns 1 if requests in `b` are contained in `a`. */
+int
+is_subpath(struct path_entry *a, struct path_entry *b)
+{
+	size_t min_nrequests = MIN(a->nrequests, b->nrequests);
+	size_t ncmp = min_nrequests * sizeof(a->requests[0]);
+	return b->nrequests <= a->nrequests
+	    && memcmp(a->requests, b->requests, ncmp) == 0;
+}
+
+/* Merges information in path entry `b` to `a`. */
+void
+merge_path_entries(struct path_entry *a, struct path_entry *b)
+{
+	assert(b->nrequests <= a->nrequests);
+
+	for (size_t ri = 0; ri < b->nrequests; ri++) {
+		a->total_hits += b->total_hits;
+		a->hits[ri] += b->hits[ri];
+	}
+}
+
+int
+cmp_path_entries_by_hit_count(const void *p1, const void *p2)
+{
+	const struct path_entry *pe1 = p1;
+	const struct path_entry *pe2 = p2;
+	return pe1->total_hits <= pe2->total_hits;
+}
+
+void
+gen_path_list(struct path_list *pl, struct request_table *rt,
+               struct session_table *st)
+{
+	assert(rt != NULL);
+	assert(st != NULL);
+
+	/* Compute total non-unique path count and allocate that many
+	 * path list nodes. */
+	size_t total_npaths = 0;
+	for (size_t i = 0; i < SESSION_TABLE_NBUCKETS; i++)
+		total_npaths += HASH_COUNT(st->handles[i]);
+
+	pl->paths = calloc(total_npaths, sizeof(pl->paths[0]));
+	if (pl->paths == NULL)
+		err(1, "error: calloc");
+	pl->total_npaths = total_npaths;
+
+	/* Initialize newly allocated path list nodes
+	 * with each session's request hit counts set to 1. */
+	size_t pi = 0;
+	for (size_t bi = 0; bi < SESSION_TABLE_NBUCKETS; bi++) {
+		struct session_entry *se, *tmp;
+		HASH_ITER(hh, st->handles[bi], se, tmp) {
+			struct path_entry *pe = &pl->paths[pi];
+			pe->nrequests = se->nrequests;
+			for (size_t ri = 0; ri < pe->nrequests; ri++) {
+				pe->requests[ri] = se->requests[ri];
+				pe->total_hits = 1;
+				pe->hits[ri] = 1;
+			}
+			pi++;
+		}
+	}
+
+	/* Sort path list nodes according to request pointer layout */
+	qsort(pl->paths, pl->total_npaths, sizeof(pl->paths[0]),
+	    cmp_path_entries_by_request_order);
+
+	/* At this point, we can merge subsequent path chains into one. */
+	size_t pi_start = 0;
+	size_t pi_end = 1;
+	size_t common_npaths = 0;
+	while (pi_end < total_npaths) {
+		struct path_entry *pe_start = &pl->paths[pi_start];
+		struct path_entry *pe_end = &pl->paths[pi_end];
+
+		if (is_subpath(pe_start, pe_end)) {
+			merge_path_entries(pe_start, pe_end);
+			pi_end++;
+		} else {
+			pi_start = pi_end;
+			pi_end++;
+			pl->paths[common_npaths] = *pe_start;
+			common_npaths++;
+		}
+	}
+
+	pl->common_npaths = common_npaths;
+
+	/* Finally sort by total hit counts. */
+	qsort(pl->paths, pl->common_npaths, sizeof(pl->paths[0]),
+	    cmp_path_entries_by_hit_count);
+}
+
+void
+output_yaml(struct path_list *pl)
+{
+	printf("---\n");
+
+	printf(
+"total_sessions: %zu\n"
+"common_paths: %zu\n"
+"paths:\n", pl->total_npaths, pl->common_npaths);
+
+	for (size_t pi = 0; pi < pl->common_npaths; pi++) {
+		struct path_entry *pe = &pl->paths[pi];
+		printf(
+"    - %zu:\n"
+"        - hits: %" PRIu64 "\n"
+"        - requests:\n", pi + 1, pe->total_hits);
+		for (size_t ri = 0; ri < pe->nrequests; ri++) {
+			char *re_data = pe->requests[ri];
+			printf(
+"            - %s\n"
+"                - hits: %" PRIu64 "\n", re_data, pe->hits[ri]);
+		}
+	}
+
+	printf("...\n");
+}
+
 void
 cleanup_work_ctx(struct work_ctx *work_ctx)
 {
@@ -1068,6 +1214,9 @@ main(int argc, char **argv)
 	struct session_table st;
 	struct work_ctx work_ctx;
 
+	/* Post-processing data */
+	struct path_list pl;
+
 	while (1) {
 		int opt_idx = 0;
 		static struct option long_opts[] = {
@@ -1135,6 +1284,10 @@ main(int argc, char **argv)
 
 	/* Wait for worker threads to finish */
 	cleanup_work_ctx(&work_ctx);
+
+	/* Do post-processing */
+	gen_path_list(&pl, &rt, &st);
+	output_yaml(&pl);
 
 	//debug_request_table(&rt);
 	//debug_session_table(&st);
