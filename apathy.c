@@ -1095,30 +1095,30 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 }
 
 void
-output_yaml(struct path_list *pl)
+output_yaml(struct path_list *pl, FILE *out)
 {
-	printf("---\n");
+	fprintf(out, "---\n");
 
-	printf(
+	fprintf(out,
 "total_sessions: %zu\n"
 "common_paths: %zu\n"
 "paths:\n", pl->total_npaths, pl->common_npaths);
 
 	for (size_t pi = 0; pi < pl->common_npaths; pi++) {
 		struct path_entry *pe = &pl->paths[pi];
-		printf(
+		fprintf(out,
 "    - %zu:\n"
 "        - hits: %" PRIu64 "\n"
 "        - requests:\n", pi + 1, pe->total_hits);
 		for (size_t ri = 0; ri < pe->nrequests; ri++) {
 			char *re_data = pe->requests[ri];
-			printf(
+			fprintf(out,
 "            - %s\n"
 "                - hits: %" PRIu64 "\n", re_data, pe->hits[ri]);
 		}
 	}
 
-	printf("...\n");
+	fprintf(out, "...\n");
 }
 
 void
@@ -1217,19 +1217,23 @@ main(int argc, char **argv)
 	/* Post-processing data */
 	struct path_list pl;
 
+	const char *output_path = "-";
+	FILE *out = stdout;
+
 	while (1) {
 		int opt_idx = 0;
 		static struct option long_opts[] = {
 			{"help",            no_argument,       0, 'h' },
 			{"ignore-patterns", required_argument, 0, 'I' },
 			{"merge-patterns",  required_argument, 0, 'M' },
+			{"output",          required_argument, 0, 'o' },
 			{"session",         required_argument, 0, 'S' },
 			{"threads",         required_argument, 0, 'T' },
 			{"version",         no_argument,       0, 'V' },
 			{0,                 0,                 0,  0  }
 		};
 
-		int c = getopt_long(argc, argv, "hI:M:S:T:V", long_opts, &opt_idx);
+		int c = getopt_long(argc, argv, "hI:M:o:S:T:V", long_opts, &opt_idx);
 		if (c == -1)
 			break;
 
@@ -1244,6 +1248,14 @@ main(int argc, char **argv)
 
 		case 'M':
 			//merge_patterns = optarg;
+			break;
+		case 'o':
+			output_path = optarg;
+			if (strcmp(output_path, "-") != 0) {
+				out = fopen(output_path, "w");
+				if (out == NULL)
+					err(1, "failed to create output file at %s", output_path);
+			}
 			break;
 		case 'S':
 			session_fields = optarg;
@@ -1287,7 +1299,7 @@ main(int argc, char **argv)
 
 	/* Do post-processing */
 	gen_path_list(&pl, &rt, &st);
-	output_yaml(&pl);
+	output_yaml(&pl, out);
 
 	//debug_request_table(&rt);
 	//debug_session_table(&st);
@@ -1317,12 +1329,15 @@ usage(void)
 "    -I, --ignore-patterns <pattern_file>    File containing URL patterns for ignoring HTTP requests\n"
 "    -M, --merge-patterns <pattern_file>     File containing URL patterns for merging HTTP requests\n"
 "\n"
+"    -o, --output <output_file>              File for output\n"
+"                                              default: \"-\" (standard output)\n"
+"\n"
 "    -S, --session <session_fields>          Comma-separated fields used to construct a session ID for a request\n"
-"                                            Available fields: ip1,ip2,useragent\n"
-"                                            Default: ip1,useragent\n"
+"                                              available fields: ip1,ip2,useragent\n"
+"                                              default: ip1,useragent\n"
 "\n"
 "    -T, --threads <num_threads>             Number of worker threads\n"
-"                                            Default: number of logical CPU cores, or 4 as a fallback\n"
+"                                              default: number of logical CPU cores, or 4 as a fallback\n"
 "\n"
 "ARGUMENTS:\n"
 "    <ACCESS_LOG>    Access log file containing HTTP request timestamps, IP addresses, methods, URLs and User Agent headers\n",
