@@ -217,7 +217,7 @@ struct session_table {
 /* Aggregated path information. */
 struct path_entry {
 	size_t   nrequests;           /* Number of requests */
-	uint64_t total_hits;          /* Total path hits */
+	uint64_t nstarts;             /* Number of path starts */
 	char    *requests[MAX_DEPTH]; /* Request fields */
 	uint64_t hits[MAX_DEPTH];     /* Total hits up until each request */
 	/* TODO: average pauses, repeats */
@@ -225,7 +225,7 @@ struct path_entry {
 
 struct path_list {
 	size_t total_npaths;
-	size_t common_npaths;
+	size_t shared_npaths;
 	struct path_entry *paths;
 };
 
@@ -1011,20 +1011,20 @@ merge_path_entries(struct path_entry *a, struct path_entry *b)
 	assert(b->nrequests <= a->nrequests);
 
 	for (size_t ri = 0; ri < b->nrequests; ri++) {
-		a->total_hits += b->total_hits;
 		a->hits[ri] += b->hits[ri];
+		a->nstarts = a->hits[ri];
 	}
 }
 
 int
-cmp_path_entries_by_hit_count(const void *p1, const void *p2)
+cmp_path_entries_by_start_count(const void *p1, const void *p2)
 {
 	const struct path_entry *pe1 = p1;
 	const struct path_entry *pe2 = p2;
-	if (pe1->total_hits == pe2->total_hits)
+	if (pe1->nstarts == pe2->nstarts)
 		return pe1->nrequests <= pe2->nrequests;
 	else
-		return pe1->total_hits <= pe2->total_hits;
+		return pe1->nstarts <= pe2->nstarts;
 }
 
 void
@@ -1045,8 +1045,10 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 		err(1, "error: calloc");
 	pl->total_npaths = total_npaths;
 
-	/* Initialize newly allocated path list nodes
-	 * with each session's request hit counts set to 1. */
+	/*
+	 * Initialize newly allocated path list nodes
+	 * with each session's request hit counts set to 1.
+	 */
 	size_t pi = 0;
 	for (size_t bi = 0; bi < SESSION_TABLE_NBUCKETS; bi++) {
 		struct session_entry *se, *tmp;
@@ -1055,7 +1057,7 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 			pe->nrequests = se->nrequests;
 			for (size_t ri = 0; ri < pe->nrequests; ri++) {
 				pe->requests[ri] = se->requests[ri];
-				pe->total_hits = 1;
+				pe->nstarts = 1;
 				pe->hits[ri] = 1;
 			}
 			pi++;
@@ -1069,7 +1071,7 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 	/* At this point, we can merge subsequent path chains into one. */
 	size_t pi_start = 0;
 	size_t pi_end = 1;
-	size_t common_npaths = 1;
+	size_t shared_npaths = 1;
 	while (pi_end < total_npaths) {
 		struct path_entry *pe_start = &pl->paths[pi_start];
 		struct path_entry *pe_end = &pl->paths[pi_end];
@@ -1080,16 +1082,16 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 		} else {
 			pi_start = pi_end;
 			pi_end++;
-			pl->paths[common_npaths - 1] = *pe_start;
-			common_npaths++;
+			pl->paths[shared_npaths - 1] = *pe_start;
+			shared_npaths++;
 		}
 	}
 
-	pl->common_npaths = common_npaths;
+	pl->shared_npaths = shared_npaths;
 
-	/* Finally sort by total hit counts. */
-	qsort(pl->paths, pl->common_npaths, sizeof(pl->paths[0]),
-	    cmp_path_entries_by_hit_count);
+	/* Finally sort by start counts. */
+	qsort(pl->paths, pl->shared_npaths, sizeof(pl->paths[0]),
+	    cmp_path_entries_by_start_count);
 }
 
 void
@@ -1098,16 +1100,16 @@ output_yaml(struct path_list *pl, FILE *out)
 	fprintf(out, "---\n");
 
 	fprintf(out,
-"total_sessions: %zu\n"
-"common_paths: %zu\n"
-"paths:\n", pl->total_npaths, pl->common_npaths);
+"unique_sessions: %zu\n"
+"shared_paths: %zu\n"
+"paths:\n", pl->total_npaths, pl->shared_npaths);
 
-	for (size_t pi = 0; pi < pl->common_npaths; pi++) {
+	for (size_t pi = 0; pi < pl->shared_npaths; pi++) {
 		struct path_entry *pe = &pl->paths[pi];
 		fprintf(out,
 "    - %zu:\n"
-"        - hits: %" PRIu64 "\n"
-"        - requests:\n", pi + 1, pe->total_hits);
+"        - starts: %" PRIu64 "\n"
+"        - requests:\n", pi + 1, pe->nstarts);
 		for (size_t ri = 0; ri < pe->nrequests; ri++) {
 			char *re_data = pe->requests[ri];
 			fprintf(out,
