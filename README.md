@@ -6,14 +6,14 @@ Access log PATH analYzer
 STATUS
 ------
 
-WORK IN PROGRESS
+**WORK IN PROGRESS**
 
 OVERVIEW
 --------
 
 This tool is used to trace HTTP request paths from access logs,
 which can be useful when designing load tests or just figuring out
-patterns on how other people or systems are using a specific web service.
+how other people or systems are using a specific web service.
 
 For example, supposed you had an access log with following lines
 in a file named `my_access.log`:
@@ -33,6 +33,7 @@ Running the command below...
 
 ...would produce the following output:
 
+    ---
     unique_sessions: 3
     shared_paths: 2
     paths:
@@ -54,6 +55,7 @@ Running the command below...
                     - hits: 1
                 - POST http://my-api/data
                     - hits: 1
+    ...
 
 Analyzing the output, we find the following features:
 
@@ -106,26 +108,27 @@ USAGE
 The program expects that any log files fed to it contain
 at least the following fields:
 
-  * RFC3339-formatted timestamp with millisecond precision
+  * RFC3339-formatted timestamp with millisecond precision.
     - example: `2018-01-01T12:30:00.400`
-  * Request field, surrounded by double quotes, with the method and URL inside,
+  * Request field, surrounded by double quotes, with the method and URL inside.
     - example: `"GET https://my-api/v1/data?limit=50 HTTP/1.0"`
 
 Additionally, at least one of the following fields must be present,
 in order to identify meaningul session information:
 
-  * Source IPv4 address, with or without a port number,
+  * Source IPv4 address, with or without a port number.
     - examples: `127.0.0.1:5000` or `10.1.1.50`
-  * User agent string, surrounded by double quotes,
+  * User agent string, surrounded by double quotes.
     - example: `"Mozilla 5.0 ..."`
 
 
 TODO
 ----
 
-  * Deterministic multithreading
-  * Ignore patterns
-  * Truncate patterns
-  * Merge patterns
+  * deterministic multithreading
+  * ignore patterns
+  * truncate patterns
+  * merge patterns
   * IPv6 source and destination addresses
-  * Tests
+  * tests
+  * non-surrounded request fields
