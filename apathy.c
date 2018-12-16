@@ -204,7 +204,6 @@ struct session_entry {
 	int       nrequests;             /* Number of requests in session */
 	uint64_t  timestamps[MAX_DEPTH]; /* Request timestamps */
 	char     *requests[MAX_DEPTH];   /* Request fields */
-	uint64_t  repeats[MAX_DEPTH];    /* Repeats per request */
 	UT_hash_handle hh;
 };
 
@@ -336,6 +335,8 @@ compile_regex(regex_t *preg, const char *pattern)
  * "GET http://my-api/" instead of '"GET' and 'http://my-api/"'.
  *
  * Returns the number of fields found.
+ *
+ * TODO: use strspn(3), strcspn(3)
  */
 int
 get_fields(struct field_view *fvs, int max_fields, const char *src,
@@ -739,10 +740,11 @@ amend_session_entry(struct session_table *st, uint64_t sid, uint64_t ts, char *r
 	int i;
 	struct session_entry *se = NULL;
 
-	/* TODO: more event bucket indexing */
+	/* TODO: make sid better distributed */
 	size_t bucket_idx = hash64_init();
 	bucket_idx = hash64_update(bucket_idx, (void *)&sid, sizeof(sid));
 	bucket_idx &= SESSION_TABLE_BUCKET_MASK;
+
 	/* We have to use pointer to a pointer, otherwise the uthash
 	 * macros don't work as intended.  */
 	struct session_entry **handlep = &st->handles[bucket_idx];
@@ -786,14 +788,10 @@ amend:
 	 * Check if request at previous or current index is identical;
 	 * if yes, increment repeat count accordingly.
 	 * */
-	if (se->requests[i - 1] == re_data) {
-		se->repeats[i - 1]++;
+	if (se->requests[i - 1] == re_data)
 		goto finish;
-	}
-	if (se->requests[i] == re_data) {
-		se->repeats[i]++;
+	if (se->requests[i] == re_data)
 		goto finish;
-	}
 
 	/* Shift the more recent requests up one index
 	 * to make room for the current request. */
@@ -850,14 +848,8 @@ run_thread(void *ctx)
 			case FIELD_TS_RFC3339:
 				ts = ts_rfc3339_to_ms(fv->src);
 				break;
-			case FIELD_IPADDR:
-				sid = hash64_update(sid, fv->src, fv->len);
-				break;
 			case FIELD_REQUEST:
 				re_data = set_request_entry(fv->src, rt);
-				break;
-			case FIELD_USERAGENT:
-				sid = hash64_update(sid, fv->src, fv->len);
 				break;
 			default:
 				break;
@@ -940,16 +932,19 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 	int rc;
 
 #define MT_THRESHOLD (4 * 1024 * 1024)
-	/* If log size is under MT_THRESHOLD, we use 1 thread. */
+	/* If log size is under MT_THRESHOLD, use one thread. */
 	if (log_ctx->len < MT_THRESHOLD)
 		nthreads = 1;
 	else if (nthreads == -1) {
-		nthreads = sysconf(_SC_NPROCESSORS_CONF);
-		if (nthreads == -1) {
-			warn("failed to read CPU core count, using %d threads by default",
-			     NTHREADS_DEFAULT);
-			nthreads = NTHREADS_DEFAULT;
-		}
+		nthreads = 1;
+		/* TODO: uncomment this when multithreading is deterministic
+		 * nthreads = sysconf(_SC_NPROCESSORS_CONF);
+		 * if (nthreads == -1) {
+		 * 	warn("failed to read CPU core count, using %d threads by default",
+		 * 	     NTHREADS_DEFAULT);
+		 * 	nthreads = NTHREADS_DEFAULT;
+		 * }
+		 */
 	}
 
 	if (nthreads > NTHREADS_MAX)
@@ -1026,7 +1021,10 @@ cmp_path_entries_by_hit_count(const void *p1, const void *p2)
 {
 	const struct path_entry *pe1 = p1;
 	const struct path_entry *pe2 = p2;
-	return pe1->total_hits <= pe2->total_hits;
+	if (pe1->total_hits == pe2->total_hits)
+		return pe1->nrequests <= pe2->nrequests;
+	else
+		return pe1->total_hits <= pe2->total_hits;
 }
 
 void
@@ -1071,7 +1069,7 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 	/* At this point, we can merge subsequent path chains into one. */
 	size_t pi_start = 0;
 	size_t pi_end = 1;
-	size_t common_npaths = 0;
+	size_t common_npaths = 1;
 	while (pi_end < total_npaths) {
 		struct path_entry *pe_start = &pl->paths[pi_start];
 		struct path_entry *pe_end = &pl->paths[pi_end];
@@ -1082,7 +1080,7 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 		} else {
 			pi_start = pi_end;
 			pi_end++;
-			pl->paths[common_npaths] = *pe_start;
+			pl->paths[common_npaths - 1] = *pe_start;
 			common_npaths++;
 		}
 	}

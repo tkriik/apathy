@@ -5,6 +5,7 @@ callgrind.*
 cachegrind.*
 local/
 cpu_profile
+profile
 
 # Prerequisites
 *.d
