@@ -6,7 +6,7 @@
  * 1. We map the log file into memory, so that multiple gigabyte sized
  *    log files pose no issues.
  *
- *    - init_log_ctx()
+ *    - init_log_view()
  *
  * -----------------------------------------------------------------------------
  *
@@ -54,11 +54,11 @@
  *    4.2 A truncated copy of the request field, with only method and URL,
  *        is stored in a hash table, for avoiding duplicate storage for
  *        identical requests.
- *        There are multiple hash tables (REQUEST_TABLE_NBUCKETS),
+ *        There are multiple hash tables (REQUEST_SET_NBUCKETS),
  *        each with separate locks, in order to reduce lock contention
  *        across multiple threads.
  *
- *          - set_request_entry()
+ *          - add_request_set_entry()
  *
  *    --------------------------------------------------------------------------
  *
@@ -69,10 +69,10 @@
  *        to the session entry if it is a repeated request, in which case
  *        only the repeat count for that request is incremented.
  *        As with request table, there are
- *        multiple hash tables (SESSION_TABLE_NBUCKETS) for session entries,
+ *        multiple hash tables (SESSION_MAP_NBUCKETS) for session entries,
  *        each with separate locks.
  *
- *          - amend_session_entry()
+ *          - amend_session_map_entry()
  */
 
 #include <sys/types.h>
@@ -101,7 +101,7 @@
 
 #define MIN(A, B) ((A) < (B) ? (A) : (B))
 
-struct log_ctx {
+struct log_view {
 	size_t      len;  /* Size of log file plus one */
 	const char *path; /* Path to log file */
 	const char *src;  /* Memory-mapped log contents */
@@ -162,20 +162,20 @@ struct thread_chunk {
 };
 
 /* Request-specific info, stored in a hash table. */
-struct request_entry {
+struct request_set_entry {
 	char *data;
 	UT_hash_handle hh;
 };
 
-#define REQUEST_TABLE_NBUCKETS    (1 << 8)
-#define REQUEST_TABLE_BUCKET_MASK (REQUEST_TABLE_NBUCKETS - 1)
-struct request_table {
-	struct request_entry *handles[REQUEST_TABLE_NBUCKETS];
-	pthread_spinlock_t    locks[REQUEST_TABLE_NBUCKETS];
+#define REQUEST_SET_NBUCKETS    (1 << 8)
+#define REQUEST_SET_BUCKET_MASK (REQUEST_SET_NBUCKETS - 1)
+struct request_set {
+	struct request_set_entry *handles[REQUEST_SET_NBUCKETS];
+	pthread_spinlock_t        locks[REQUEST_SET_NBUCKETS];
 };
 
 /* Session-specific information, stored in a hash table. */
-struct session_entry {
+struct session_map_entry {
 #define MAX_DEPTH 16
 	uint64_t  sid;                   /* Session ID */
 	int       nrequests;             /* Number of requests in session */
@@ -184,11 +184,11 @@ struct session_entry {
 	UT_hash_handle hh;
 };
 
-#define SESSION_TABLE_NBUCKETS    (1 << 16)
-#define SESSION_TABLE_BUCKET_MASK (SESSION_TABLE_NBUCKETS - 1)
-struct session_table {
-	struct session_entry *handles[SESSION_TABLE_NBUCKETS];
-	pthread_spinlock_t    locks[SESSION_TABLE_NBUCKETS];
+#define SESSION_MAP_NBUCKETS    (1 << 16)
+#define SESSION_MAP_BUCKET_MASK (SESSION_MAP_NBUCKETS - 1)
+struct session_map {
+	struct session_map_entry *handles[SESSION_MAP_NBUCKETS];
+	pthread_spinlock_t    locks[SESSION_MAP_NBUCKETS];
 };
 
 /* Aggregated path information. */
@@ -210,11 +210,11 @@ struct path_list {
 struct thread_ctx {
 	int    id;
 
-	struct log_ctx *log_ctx;
+	struct log_view *log_view;
 	struct line_config *line_config;
 	struct thread_chunk chunk;
-	struct request_table *request_table;
-	struct session_table *session_table;
+	struct request_set *request_set;
+	struct session_map *session_map;
 };
 
 /*
@@ -254,8 +254,8 @@ struct field_view {
 	const char *src;
 };
 
-void debug_request_table(struct request_table *);
-void debug_session_table(struct session_table *);
+void debug_request_set(struct request_set *);
+void debug_session_map(struct session_map *);
 void usage(void);
 
 void *
@@ -426,7 +426,7 @@ fill_fields:
 }
 
 void
-init_log_ctx(struct log_ctx *ctx, const char *path)
+init_log_view(struct log_view *ctx, const char *path)
 {
 	ctx->src = mmap_file(path, &ctx->len);
 	ctx->path = path;
@@ -631,14 +631,14 @@ hash64_update_char(uint64_t hash, char c)
  * or existing, request entry.
  */
 char *
-set_request_entry(const char *src, struct request_table *rt)
+add_request_set_entry(const char *src, struct request_set *rs)
 {
 	assert(src != NULL);
 
 	size_t bucket_idx = hash64_init();
-	struct request_entry **handlep;
+	struct request_set_entry **handlep;
 	pthread_spinlock_t *lock;
-	struct request_entry *re;
+	struct request_set_entry *entry;
 
 	int rc;
 	const char *s = src;
@@ -670,35 +670,35 @@ set_request_entry(const char *src, struct request_table *rt)
 	}
 
 effective_req:
-	bucket_idx &= REQUEST_TABLE_BUCKET_MASK;
-	handlep = &rt->handles[bucket_idx];
-	lock = &rt->locks[bucket_idx];
-	re = NULL;
+	bucket_idx &= REQUEST_SET_BUCKET_MASK;
+	handlep = &rs->handles[bucket_idx];
+	lock = &rs->locks[bucket_idx];
+	entry = NULL;
 
 	rc = pthread_spin_lock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_lock");
 
-	HASH_FIND(hh, *handlep, src, req_len, re);
-	if (re != NULL)
+	HASH_FIND(hh, *handlep, src, req_len, entry);
+	if (entry != NULL)
 		goto finish;
 
-	re = calloc(1, sizeof(*re));
-	if (re == NULL)
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL)
 		err(1, "error: calloc");
 
-	re->data = calloc(1, req_len + 1);
-	if (re->data == NULL)
+	entry->data = calloc(1, req_len + 1);
+	if (entry->data == NULL)
 		err(1, "error: calloc");
-	memcpy(re->data, src, req_len);
+	memcpy(entry->data, src, req_len);
 
-	HASH_ADD_KEYPTR(hh, *handlep, re->data, req_len, re);
+	HASH_ADD_KEYPTR(hh, *handlep, entry->data, req_len, entry);
 finish:
 	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_unlock");
 
-	return re->data;
+	return entry->data;
 }
 
 /*
@@ -708,79 +708,79 @@ finish:
  * to keep the session request list in order at each modification.
  */
 void
-amend_session_entry(struct session_table *st, uint64_t sid, uint64_t ts, char *re_data)
+amend_session_map_entry(struct session_map *sm, uint64_t sid, uint64_t ts, char *re_data)
 {
-	assert(st != NULL);
+	assert(sm != NULL);
 	assert(re_data != NULL);
 
 	int rc;
 	int i;
-	struct session_entry *se = NULL;
+	struct session_map_entry *entry = NULL;
 
 	/* TODO: make sid better distributed */
 	size_t bucket_idx = hash64_init();
 	bucket_idx = hash64_update(bucket_idx, (void *)&sid, sizeof(sid));
-	bucket_idx &= SESSION_TABLE_BUCKET_MASK;
+	bucket_idx &= SESSION_MAP_BUCKET_MASK;
 
 	/* We have to use pointer to a pointer, otherwise the uthash
 	 * macros don't work as intended.  */
-	struct session_entry **handlep = &st->handles[bucket_idx];
-	pthread_spinlock_t *lock = &st->locks[bucket_idx];
+	struct session_map_entry **handlep = &sm->handles[bucket_idx];
+	pthread_spinlock_t *lock = &sm->locks[bucket_idx];
 
 	rc = pthread_spin_lock(lock);
 	if (rc != 0)
 		err(1, "error: pthread_spin_lock");
 
-	HASH_FIND_INT(*handlep, &sid, se);
-	if (se != NULL) {
+	HASH_FIND_INT(*handlep, &sid, entry);
+	if (entry != NULL) {
 		//printf("found sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
-		if (se->nrequests == MAX_DEPTH)
+		if (entry->nrequests == MAX_DEPTH)
 			goto finish;
 		else
 			goto amend;
 	}
 
-	se = calloc(1, sizeof(*se));
-	if (se == NULL)
+	entry = calloc(1, sizeof(*entry));
+	if (entry == NULL)
 		err(1, "error: calloc");
-	se->sid = sid;
-	se->nrequests = 0;
+	entry->sid = sid;
+	entry->nrequests = 0;
 
-	HASH_ADD_INT(*handlep, sid, se);
+	HASH_ADD_INT(*handlep, sid, entry);
 	//printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
-	//struct session_entry *tmp_se;
+	//struct session_map_entry *tmp_se;
 	//HASH_FIND_INT(handle, &sid, tmp_se);
 	//if (tmp_se != NULL) {
 	//	printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
 	//}
 amend:
-	i = se->nrequests;
+	i = entry->nrequests;
 	if (i == 0)
 		goto first;
 
 	/* Rewind index to sorted timestamp position. */
-	for (; 0 < i && ts < se->timestamps[i - 1]; i--);
+	for (; 0 < i && ts < entry->timestamps[i - 1]; i--);
 
 	/*
 	 * Check if request at previous or current index is identical;
 	 * if yes, increment repeat count accordingly.
 	 * */
-	if (se->requests[i - 1] == re_data)
+	if (entry->requests[i - 1] == re_data)
 		goto finish;
-	if (se->requests[i] == re_data)
+	if (entry->requests[i] == re_data)
 		goto finish;
 
 	/* Shift the more recent requests up one index
 	 * to make room for the current request. */
-	int nmove = se->nrequests - i;
-	memmove(&se->timestamps[i + 1], &se->timestamps[i],
-	    nmove * sizeof(se->timestamps[0]));
-	memmove(&se->requests[i + 1], &se->requests[i],
-	    nmove * sizeof(se->requests[0]));
+	int nmove = entry->nrequests - i;
+	memmove(&entry->timestamps[i + 1], &entry->timestamps[i],
+	    nmove * sizeof(entry->timestamps[0]));
+	memmove(&entry->requests[i + 1], &entry->requests[i],
+	    nmove * sizeof(entry->requests[0]));
 first:
-	se->requests[i] = re_data;
-	se->timestamps[i] = ts;
-	se->nrequests++;
+	entry->requests[i] = re_data;
+	entry->timestamps[i] = ts;
+	entry->nrequests++;
 finish:
 	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
@@ -793,17 +793,17 @@ run_thread(void *ctx)
 	assert(ctx != NULL);
 
 	struct thread_ctx *thread_ctx = ctx;
-	struct log_ctx *log_ctx = thread_ctx->log_ctx;
+	struct log_view *log_view = thread_ctx->log_view;
 	const char *src = thread_ctx->chunk.start;
 	struct line_config *lc = thread_ctx->line_config;
-	struct request_table *rt = thread_ctx->request_table;
-	struct session_table *st = thread_ctx->session_table;
+	struct request_set *rt = thread_ctx->request_set;
+	struct session_map *sm = thread_ctx->session_map;
 
 	while (1) {
 		if (thread_ctx->chunk.end <= src || src == NULL)
 			break;
 
-		int skip_line_seek = log_ctx->src == src;
+		int skip_line_seek = log_view->src == src;
 		struct field_view fvs[NFIELDS_MAX] = {0};
 
 		int nfields = get_fields(fvs, NFIELDS_MAX, src, skip_line_seek, &src);
@@ -826,28 +826,28 @@ run_thread(void *ctx)
 				ts = ts_rfc3339_to_ms(fv->src);
 				break;
 			case FIELD_REQUEST:
-				re_data = set_request_entry(fv->src, rt);
+				re_data = add_request_set_entry(fv->src, rt);
 				break;
 			default:
 				break;
 			}
 		}
 
-		amend_session_entry(st, sid, ts, re_data);
+		amend_session_map_entry(sm, sid, ts, re_data);
 	} 
 
 	pthread_exit(NULL);
 }
 
 void
-init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
+init_line_config(struct line_config *lc, struct log_view *log_view,
 		 struct regex_info *rx_info, const char *session_fields)
 {
 	assert(lc != NULL);
-	assert(log_ctx != NULL);
+	assert(log_view != NULL);
 	assert(rx_info != NULL);
 
-	const char *src = log_ctx->src;
+	const char *src = log_view->src;
 
 	memset(lc, 0, sizeof(*lc));
 	*lc = (struct line_config){
@@ -876,41 +876,41 @@ init_line_config(struct line_config *lc, struct log_ctx *log_ctx,
 }
 
 void
-init_request_table(struct request_table *rt)
+init_request_set(struct request_set *rs)
 {
-	for (size_t i = 0; i< REQUEST_TABLE_NBUCKETS; i++) {
-		rt->handles[i] = NULL;
-		if (pthread_spin_init(&rt->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
+	for (size_t i = 0; i< REQUEST_SET_NBUCKETS; i++) {
+		rs->handles[i] = NULL;
+		if (pthread_spin_init(&rs->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
 			err(1, "error: pthread_spin_init");
 	}
 }
 
 void
-init_session_table(struct session_table *st)
+init_session_map(struct session_map *sm)
 {
-	for (size_t i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
-		st->handles[i] = NULL;
-		if (pthread_spin_init(&st->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
+	for (size_t i = 0; i < SESSION_MAP_NBUCKETS; i++) {
+		sm->handles[i] = NULL;
+		if (pthread_spin_init(&sm->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
 			err(1, "error: pthread_spin_init");
 	}
 }
 
 void
-init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
-              struct line_config *lc, struct request_table *rt,
-	      struct session_table *st)
+init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view,
+              struct line_config *lc, struct request_set *rs,
+	      struct session_map *sm)
 {
 	assert(work_ctx != NULL);
-	assert(log_ctx != NULL);
+	assert(log_view != NULL);
 	assert(lc != NULL);
-	assert(rt != NULL);
-	assert(st != NULL);
+	assert(rs != NULL);
+	assert(sm != NULL);
 
 	int rc;
 
 #define MT_THRESHOLD (4 * 1024 * 1024)
 	/* If log size is under MT_THRESHOLD, use one thread. */
-	if (log_ctx->len < MT_THRESHOLD)
+	if (log_view->len < MT_THRESHOLD)
 		nthreads = 1;
 	else if (nthreads == -1) {
 		nthreads = 1;
@@ -931,8 +931,8 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 
 	work_ctx->nthreads = nthreads;
 
-	size_t chunk_size = log_ctx->len / nthreads;
-	size_t chunk_rem = log_ctx->len % nthreads;
+	size_t chunk_size = log_view->len / nthreads;
+	size_t chunk_rem = log_view->len % nthreads;
 	for (int tid = 0; tid < nthreads; tid++) {
 		size_t start_offset;
 		size_t end_offset;
@@ -946,14 +946,14 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_ctx *log_ctx,
 
 		thread_ctx = &work_ctx->thread_ctx[tid];
 
-		thread_ctx->log_ctx       = log_ctx;
-		thread_ctx->line_config   = lc;
-		thread_ctx->id            = tid;
-		thread_ctx->chunk.start   = log_ctx->src + start_offset;
-		thread_ctx->chunk.end     = log_ctx->src + end_offset;
-		thread_ctx->chunk.size    = end_offset - start_offset;
-		thread_ctx->request_table = rt;
-		thread_ctx->session_table = st;
+		thread_ctx->log_view    = log_view;
+		thread_ctx->line_config = lc;
+		thread_ctx->id          = tid;
+		thread_ctx->chunk.start = log_view->src + start_offset;
+		thread_ctx->chunk.end   = log_view->src + end_offset;
+		thread_ctx->chunk.size  = end_offset - start_offset;
+		thread_ctx->request_set = rs;
+		thread_ctx->session_map = sm;
 
 		rc = pthread_create(&work_ctx->thread[tid], NULL, run_thread,
 		                    (void *)thread_ctx);
@@ -1005,17 +1005,17 @@ cmp_path_entries_by_start_count(const void *p1, const void *p2)
 }
 
 void
-gen_path_list(struct path_list *pl, struct request_table *rt,
-               struct session_table *st)
+gen_path_list(struct path_list *pl, struct request_set *rt,
+               struct session_map *sm)
 {
 	assert(rt != NULL);
-	assert(st != NULL);
+	assert(sm != NULL);
 
 	/* Compute total non-unique path count and allocate that many
 	 * path list nodes. */
 	size_t total_npaths = 0;
-	for (size_t i = 0; i < SESSION_TABLE_NBUCKETS; i++)
-		total_npaths += HASH_COUNT(st->handles[i]);
+	for (size_t i = 0; i < SESSION_MAP_NBUCKETS; i++)
+		total_npaths += HASH_COUNT(sm->handles[i]);
 
 	pl->paths = calloc(total_npaths, sizeof(pl->paths[0]));
 	if (pl->paths == NULL)
@@ -1027,9 +1027,9 @@ gen_path_list(struct path_list *pl, struct request_table *rt,
 	 * with each session's request hit counts set to 1.
 	 */
 	size_t pi = 0;
-	for (size_t bi = 0; bi < SESSION_TABLE_NBUCKETS; bi++) {
-		struct session_entry *se, *tmp;
-		HASH_ITER(hh, st->handles[bi], se, tmp) {
+	for (size_t bi = 0; bi < SESSION_MAP_NBUCKETS; bi++) {
+		struct session_map_entry *se, *tmp;
+		HASH_ITER(hh, sm->handles[bi], se, tmp) {
 			struct path_entry *pe = &pl->paths[pi];
 			pe->nrequests = se->nrequests;
 			for (size_t ri = 0; ri < pe->nrequests; ri++) {
@@ -1109,30 +1109,31 @@ cleanup_work_ctx(struct work_ctx *work_ctx)
 }
 
 void
-cleanup_request_table(struct request_table *rt)
+cleanup_request_set(struct request_set *rs)
 {
-	for (size_t i = 0; i < REQUEST_TABLE_NBUCKETS; i++) {
-		struct request_entry *r, *tmp;
-		HASH_ITER(hh, rt->handles[i], r, tmp) {
-			HASH_DEL(rt->handles[i], r);
-			free(r->data);
-			free(r);
+	for (size_t i = 0; i < REQUEST_SET_NBUCKETS; i++) {
+		struct request_set_entry *entry, *tmp;
+		HASH_ITER(hh, rs->handles[i], entry, tmp) {
+			HASH_DEL(rs->handles[i], entry);
+			free(entry->data);
+			free(entry);
 		}
-		if (pthread_spin_destroy(&rt->locks[i]) != 0)
+
+		if (pthread_spin_destroy(&rs->locks[i]) != 0)
 			warn("warning: pthread_spin_destroy");
 	}
 }
 
 void
-cleanup_session_table(struct session_table *st)
+cleanup_session_map(struct session_map *sm)
 {
-	for (int i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
-		struct session_entry *s, *tmp;
-		HASH_ITER(hh, st->handles[i], s, tmp) {
-			HASH_DEL(st->handles[i], s);
-			free(s);
+	for (int i = 0; i < SESSION_MAP_NBUCKETS; i++) {
+		struct session_map_entry *entry, *tmp;
+		HASH_ITER(hh, sm->handles[i], entry, tmp) {
+			HASH_DEL(sm->handles[i], entry);
+			free(entry);
 		}
-		int rc = pthread_spin_destroy(&st->locks[i]);
+		int rc = pthread_spin_destroy(&sm->locks[i]);
 		if (rc != 0)
 			warn("warning: pthread_spin_destroy");
 	}
@@ -1150,9 +1151,9 @@ cleanup_regex_info(struct regex_info *rx_info)
 }
 
 void
-cleanup_log_ctx(struct log_ctx *log_ctx)
+cleanup_log_view(struct log_view *log_view)
 {
-	if (munmap((char *)log_ctx->src, log_ctx->len) == -1)
+	if (munmap((char *)log_view->src, log_view->len) == -1)
 		warn("munmap");
 }
 
@@ -1184,11 +1185,11 @@ main(int argc, char **argv)
 	const char *session_fields = "ip1,useragent";
 	long nthreads = -1;
 
-	struct log_ctx log_ctx;
+	struct log_view log_view;
 	struct regex_info rx_info;
 	struct line_config lc;
-	struct request_table rt;
-	struct session_table st;
+	struct request_set rt;
+	struct session_map sm;
 	struct work_ctx work_ctx;
 
 	/* Post-processing data */
@@ -1262,29 +1263,29 @@ main(int argc, char **argv)
 	if (argc > 1)
 		errx(1, "only one access log allowed");
 
-	init_log_ctx(&log_ctx, argv[0]);
+	init_log_view(&log_view, argv[0]);
 	init_regex_info(&rx_info);
-	init_line_config(&lc, &log_ctx, &rx_info, session_fields);
-	init_request_table(&rt);
-	init_session_table(&st);
+	init_line_config(&lc, &log_view, &rx_info, session_fields);
+	init_request_set(&rt);
+	init_session_map(&sm);
 
 	/* Start worker threads */
-	init_work_ctx(&work_ctx, nthreads, &log_ctx, &lc, &rt, &st);
+	init_work_ctx(&work_ctx, nthreads, &log_view, &lc, &rt, &sm);
 
 	/* Wait for worker threads to finish */
 	cleanup_work_ctx(&work_ctx);
 
 	/* Do post-processing */
-	gen_path_list(&pl, &rt, &st);
+	gen_path_list(&pl, &rt, &sm);
 	output_yaml(&pl, out);
 
-	//debug_request_table(&rt);
+	//debug_request_set(&rt);
 	//debug_session_table(&st);
 
-	cleanup_request_table(&rt);
-	cleanup_session_table(&st);
+	cleanup_request_set(&rt);
+	cleanup_session_map(&sm);
 	cleanup_regex_info(&rx_info);
-	cleanup_log_ctx(&log_ctx);
+	cleanup_log_view(&log_view);
 
 	return 0;
 }
@@ -1323,14 +1324,14 @@ usage(void)
 }
 
 void
-debug_request_table(struct request_table *rt)
+debug_request_set(struct request_set *rs)
 {
 	printf("----- BEGIN REQUEST TABLE -----\n");
-	uint64_t min_bucket_count = HASH_COUNT(rt->handles[0]);
-	uint64_t max_bucket_count = HASH_COUNT(rt->handles[0]);
+	uint64_t min_bucket_count = HASH_COUNT(rs->handles[0]);
+	uint64_t max_bucket_count = HASH_COUNT(rs->handles[0]);
 	uint64_t total_count = 0;
-	for (size_t i = 1; i < REQUEST_TABLE_NBUCKETS; i++) {
-		size_t bucket_count = HASH_COUNT(rt->handles[i]);
+	for (size_t i = 1; i < REQUEST_SET_NBUCKETS; i++) {
+		size_t bucket_count = HASH_COUNT(rs->handles[i]);
 		total_count += bucket_count;
 		if (bucket_count < min_bucket_count)
 			min_bucket_count = bucket_count;
@@ -1339,11 +1340,11 @@ debug_request_table(struct request_table *rt)
 	}
 	printf("min_bucket_count: %" PRIu64 "\n", min_bucket_count);
 	printf("max_bucket_count: %" PRIu64 "\n", max_bucket_count);
-	printf("avg_bucket_count: %lf\n", (double)total_count / REQUEST_TABLE_NBUCKETS);
+	printf("avg_bucket_count: %lf\n", (double)total_count / REQUEST_SET_NBUCKETS);
 	printf("total_count: %" PRIu64 "\n", total_count);
-	//for (size_t i = 0; i < REQUEST_TABLE_NBUCKETS; i++) {
-	//	struct request_entry *r, *tmp;
-	//	HASH_ITER(hh, rt->handles[i], r, tmp) {
+	//for (size_t i = 0; i < REQUEST_SET_NBUCKETS; i++) {
+	//	struct request_set_entry *entry, *tmp;
+	//	HASH_ITER(hh, rs->handles[i], r, tmp) {
 	//		printf("%p %s\n", r->data, r->data);
 	//	}
 	//}
@@ -1351,14 +1352,14 @@ debug_request_table(struct request_table *rt)
 }
 
 void
-debug_session_table(struct session_table *st)
+debug_session_map(struct session_map *sm)
 {
 	printf("----- BEGIN SESSION TABLE -----\n");
-	uint64_t min_bucket_count = HASH_COUNT(st->handles[0]);
-	uint64_t max_bucket_count = HASH_COUNT(st->handles[0]);
+	uint64_t min_bucket_count = HASH_COUNT(sm->handles[0]);
+	uint64_t max_bucket_count = HASH_COUNT(sm->handles[0]);
 	uint64_t total_count = 0;
-	for (size_t i = 1; i < SESSION_TABLE_NBUCKETS; i++) {
-		size_t bucket_count = HASH_COUNT(st->handles[i]);
+	for (size_t i = 1; i < SESSION_MAP_NBUCKETS; i++) {
+		size_t bucket_count = HASH_COUNT(sm->handles[i]);
 		total_count += bucket_count;
 		if (bucket_count < min_bucket_count)
 			min_bucket_count = bucket_count;
@@ -1367,11 +1368,11 @@ debug_session_table(struct session_table *st)
 	}
 	printf("min_bucket_count: %" PRIu64 "\n", min_bucket_count);
 	printf("max_bucket_count: %" PRIu64 "\n", max_bucket_count);
-	printf("avg_bucket_count: %lf\n", (double)total_count / SESSION_TABLE_NBUCKETS);
+	printf("avg_bucket_count: %lf\n", (double)total_count / SESSION_MAP_NBUCKETS);
 	printf("total_count: %" PRIu64 "\n", total_count);
-	//for (int i = 0; i < SESSION_TABLE_NBUCKETS; i++) {
-	//	struct session_entry *se, *tmp;
-	//	HASH_ITER(hh, st->handles[i], se, tmp) {
+	//for (int i = 0; i < SESSION_MAP_NBUCKETS; i++) {
+	//	struct session_map_entry *se, *tmp;
+	//	HASH_ITER(hh, sm->handles[i], se, tmp) {
 	//		printf("%016" PRIx64 ":\n", se->sid);
 	//		for (int i = 0; i < se->nrequests; i++) {
 	//			printf("    %" PRIu64 " %p %s (%"PRIu64" repeats)\n",
