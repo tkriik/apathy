@@ -16,7 +16,7 @@ which can be useful when designing load tests or just figuring out
 how other people or systems are using a specific web service.
 
 For example, supposed you had an access log with following lines
-in a file named `my_access.log`:
+in a file named `example.log`:
 
     2018-12-12T12:00:01.000Z 127.0.0.10:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 1"
     2018-12-12T12:00:02.000Z 127.0.0.20:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 2"
@@ -26,80 +26,49 @@ in a file named `my_access.log`:
     2018-12-12T12:00:06.000Z 127.0.0.20:5000 127.0.0.1:80 "DELETE http://my-api/data" "Mozilla/5.0 USERAGENT 2"
     2018-12-12T12:00:07.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 3"
     2018-12-12T12:00:08.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/data" "Mozilla/5.0 USERAGENT 3"
+    2018-12-12T12:00:09.000Z 127.0.0.90:5000 127.0.0.1:80 "GET http://my-api/health" "httpkit"
 
 Running the command below...
 
-    $ apathy my_access.log
+    $ apathy -o example.dot example.log
 
-...would produce the following output:
+...would produce the following `dot` -formatted file named `example.dot`:
 
-    ---
-    unique_sessions: 3
-    shared_paths: 2
-    paths:
-        - 1:
-            - starts: 2
-            - requests:
-                - GET http://my-api/login
-                    - hits: 2
-                - GET http://my-api/data
-                    - hits: 2
-                - DELETE http://my-api/data
-                    - hits: 1
-        - 2:
-            - starts: 1
-            - requests:
-                - GET http://my-api/login
-                    - hits: 1
-                - GET http://my-api/data
-                    - hits: 1
-                - POST http://my-api/data
-                    - hits: 1
-    ...
+    digraph apathy_graph {
+      r0 [label="GET http://my-api/login\n(3 hits in, 3 hits out)"];
+      r1 [label="GET http://my-api/data\n(3 hits in, 2 hits out)"];
+      r2 [label="POST http://my-api/data\n(1 hits in, 0 hits out)"];
+      r3 [label="DELETE http://my-api/data\n(1 hits in, 0 hits out)"];
+      r4 [label="GET http://my-api/health\n(1 hits in, 0 hits out)"];
+    
+      r0 -> r1 [xlabel="3"];
+      r1 -> r3 [xlabel="1"];
+      r1 -> r2 [xlabel="1"];
+    }
 
-Analyzing the output, we find the following features:
 
-    unique_sessions: 3
-    ...
+Now we can, for example, use the `graphviz` tool to transform it into a PNG image:
 
-This tells us that there are three unique *sessions* during the span
-of the log, which is identified by the source IP address and user agent
-by default.
+    $ sfdp -x -Goverlap=scale -Tpng example.dot -o example.png
 
-    ...
-    shared_paths: 2
-    ...
+![alt text](example.png)
 
-Although there are three sessions, there are only two shared paths
-taken by those sessions.
+From the image we can observe the following facts:
 
-    ...
-    paths:
-        - 1:
-	    ...
-        - 2:
-	    ...
-    ...
+  * `GET http://my-api/login` was called 3 times, and each session
+    made another 3 calls after that.
+  * `GET http://my-api/data` was called 3 times, but only 2 sessions
+    made any other requests after that.
+  * `POST http://my-api/data` and `DELETE http://my-api/data` were both called
+    only once, and no requests were made after that during any sessions.
+  * `GET http://my-api/health` has been called once without a follow-up,
+    so it's probably from a monitoring service.
 
-The path listing shows all paths taken, ranked by how many times
-each path was started.
+### What is a session?
 
-    ...
-        - 1:
-            - starts: 2
-            - requests:
-                - GET http://my-api/login
-                    - hits: 2
-                - GET http://my-api/data
-                    - hits: 2
-                - DELETE http://my-api/data
-                    - hits: 1
-    ...
-
-Here we see that the first path was started 2 times.
-The `hits` field tells how many started paths ended up
-at that request, so while both paths went through the first
-two requests, only one of them ended up at the third request.
+A session is meant to identify a single user or system during the
+lifetime of a log file, consisting of the source IP address and user agent
+string by default.
 
 
 USAGE
@@ -128,7 +97,6 @@ TODO
   * deterministic multithreading
   * ignore patterns
   * truncate patterns
-  * merge patterns
   * IPv6 source and destination addresses
   * tests
   * non-surrounded request fields

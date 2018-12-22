@@ -6,7 +6,6 @@ cachegrind.*
 local/
 cpu_profile
 profile
-out
 
 # Prerequisites
 *.d

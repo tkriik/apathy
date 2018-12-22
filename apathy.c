@@ -184,8 +184,8 @@ struct request_set {
 	struct request_set_entry *handles[REQUEST_SET_NBUCKETS];
 	pthread_spinlock_t        locks[REQUEST_SET_NBUCKETS];
 	size_t                    nrequests; /* Unique request count */
-#define REQUEST_ID_INVAL 0
-#define REQUEST_ID_START 1
+#define REQUEST_ID_INVAL UINT64_MAX
+#define REQUEST_ID_START 0
 	pthread_spinlock_t        rid_lock;
 	request_id_t              rid_ctr;    /* Incremental request ID */
 };
@@ -226,21 +226,28 @@ struct path_graph_edge {
 /* Path edge information. */
 struct path_graph_vertex {
 #define PATH_GRAPH_VERTEX_INIT_LIM_NEDGES 8
-	request_id_t rid;                   /* Request ID */
-	int         is_start;               /* Is this a start vertex? */
-	uint64_t    nhits;                  /* Hits per this vertex */
-	size_t      nedges;                 /* Number of outward edges */
-	size_t      lim_nedges;             /* Edge buffer limit */
-	struct      path_graph_edge *edges; /* Outward edges */
+	request_id_t rid;                    /* Request ID */
+	size_t       nedges;                 /* Number of outward edges */
+	size_t       lim_nedges;             /* Edge buffer limit */
+	struct       path_graph_edge *edges; /* Outward edges */
+	uint64_t     total_nhits_in;         /* Total number of hits to this vertex */
+	uint64_t     total_nhits_out;        /* Total number of hits from this vertex */
+};
 
-	UT_hash_handle hh;
+const struct path_graph_vertex NULL_VERTEX = {
+	.rid             = REQUEST_ID_INVAL,
+	.nedges          = 0,
+	.lim_nedges      = 0,
+	.edges           = NULL,
+	.total_nhits_in  = 0,
+	.total_nhits_out = 0
 };
 
 struct path_graph {
-	uint64_t total_nedges;
-	uint64_t total_nhits;
-	uint64_t nstart_edges;
-	struct path_graph_vertex *vertices;
+	size_t total_nedges;                /* Total number of unique path edges */
+	size_t nvertices;                   /* Number of vertices */
+	size_t capvertices;                 /* Vertex buffer capacity */
+	struct path_graph_vertex *vertices; /* Vertex buffer */
 };
 
 /* Thread-specific context. */
@@ -946,12 +953,20 @@ init_session_map(struct session_map *sm)
 }
 
 void
-init_path_graph(struct path_graph *pg)
+init_path_graph(struct path_graph *pg, struct request_table *rt)
 {
+	assert(pg != NULL);
+	assert(rt != NULL);
+
 	pg->total_nedges = 0;
-	pg->total_nhits = 0;
-	pg->nstart_edges = 0;
-	pg->vertices = NULL;
+	pg->nvertices = 0;
+	pg->capvertices = rt->nrequests;
+	pg->vertices = calloc(pg->capvertices, sizeof(*pg->vertices));
+	if (pg->vertices == NULL)
+		ERR("%s", "calloc");
+
+	for (size_t v = 0; v < pg->capvertices; v++)
+		pg->vertices[v] = NULL_VERTEX;
 }
 
 void
@@ -1028,7 +1043,7 @@ gen_request_table(struct request_table *rt, struct request_set *rs)
 	assert(rs != NULL);
 
 	rt->nrequests = rs->nrequests;
-	rt->requests = calloc(rt->nrequests + 1, sizeof(*rt->requests));
+	rt->requests = calloc(rt->nrequests, sizeof(*rt->requests));
 	if (rt->requests == NULL)
 		ERR("%s", "calloc");
 
@@ -1040,50 +1055,45 @@ gen_request_table(struct request_table *rt, struct request_set *rs)
 	}
 }
 
+int
+is_null_vertex(struct path_graph_vertex *v)
+{
+	assert(v != NULL);
+	return v->rid == REQUEST_ID_INVAL;
+}
+
 void
-amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, int is_start,
-                        request_id_t edge_rid)
+amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t edge_rid)
 {
 	assert(pg != NULL);
 	assert(rid != REQUEST_ID_INVAL);
 
 	struct path_graph_edge *edge;
+	struct path_graph_vertex *vertex = &pg->vertices[rid];
 
-	struct path_graph_vertex *vertex = NULL;
-	HASH_FIND(hh, pg->vertices, &rid, sizeof(rid), vertex);
-	if (vertex == NULL) {
-		vertex = calloc(1, sizeof(*vertex));
-		if (vertex == NULL)
-			ERR("%s", "calloc");
-
+	if (is_null_vertex(vertex)) {
 		vertex->rid = rid;
-		vertex->is_start = is_start;
-		vertex->nhits = 1;
-		pg->total_nhits++;
-
 		vertex->edges = calloc(PATH_GRAPH_VERTEX_INIT_LIM_NEDGES, sizeof(*vertex->edges));
 		if (vertex->edges == NULL)
 			ERR("%s", "calloc");
-
 		vertex->lim_nedges = PATH_GRAPH_VERTEX_INIT_LIM_NEDGES;
+
 		if (edge_rid != REQUEST_ID_INVAL) {
-			vertex->nedges = 1;
 			edge = &vertex->edges[0];
 			edge->rid = edge_rid;
 			edge->nhits = 1;
+			vertex->nedges = 1;
+			vertex->total_nhits_out++;
 			pg->total_nedges++;
 		}
 
-		HASH_ADD(hh, pg->vertices, rid, sizeof(rid), vertex);
-
-		if (is_start)
-			pg->nstart_edges++;
+		vertex->total_nhits_in++;
+		pg->nvertices++;
 
 		return;
 	}
 
-	vertex->nhits++;
-	pg->total_nhits++;
+	vertex->total_nhits_in++;
 
 	if (edge_rid == REQUEST_ID_INVAL)
 		return;
@@ -1094,6 +1104,7 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, int is_start,
 		edge = &vertex->edges[edge_idx];
 		if (edge->rid == edge_rid) {
 			edge->nhits++;
+			vertex->total_nhits_out++;
 			return;
 		}
 	}
@@ -1104,7 +1115,6 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, int is_start,
 		/* TODO: overflow check */
 		size_t new_size = new_lim * sizeof(*vertex->edges);
 		struct path_graph_edge *new_edges = realloc(vertex->edges, new_size);
-		fprintf(stderr, "new_edges = %p IN realloc(vertex->edges = %p, new_lim = %zu)\n", new_edges, vertex->edges, new_lim);
 		if (new_edges == NULL)
 			ERR("%s", "realloc");
 		vertex->edges = new_edges;
@@ -1117,7 +1127,20 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, int is_start,
 	edge->rid = edge_rid;
 	edge->nhits = 1;
 	vertex->nedges++;
+	vertex->total_nhits_out++;
 	pg->total_nedges++;
+}
+
+int
+cmp_path_graph_edge(const void *p1, const void *p2)
+{
+	assert(p1 != NULL);
+	assert(p2 != NULL);
+
+	const struct path_graph_edge *e1 = p1;
+	const struct path_graph_edge *e2 = p2;
+
+	return e1->nhits < e2->nhits;
 }
 
 void
@@ -1128,6 +1151,7 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 	assert(rs != NULL);
 	assert(sm != NULL);
 
+	/* Generate request path edges */
 	for (size_t bucket_idx = 0; bucket_idx < SESSION_MAP_NBUCKETS;
 	     bucket_idx++) {
 		struct session_map_entry *entry, *tmp;
@@ -1136,73 +1160,69 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 			     request_idx < entry->nrequests;
 			     request_idx++, edge_idx++) {
 				request_id_t rid = entry->requests[request_idx];
-				int is_start = request_idx == 0;
 				request_id_t edge_rid = edge_idx < entry->nrequests
 				                      ? entry->requests[edge_idx]
 						      : REQUEST_ID_INVAL;
-				amend_path_graph_vertex(pg, rid, is_start, edge_rid);
+				amend_path_graph_vertex(pg, rid, edge_rid);
 			}
 		}
 	}
 }
 
 void
-cleanup_work_ctx(struct work_ctx *work_ctx)
+output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
+{
+	assert(out != NULL);
+	assert(pg != NULL);
+	assert(rt != NULL);
+
+	struct path_graph_vertex *vertex;
+	request_id_t rid;
+	const char *request_data;
+
+	fprintf(out, "digraph apathy_graph {\n");
+
+	/* Declare nodes with labels */
+	for (size_t v = 0; v < pg->capvertices; v++) {
+		vertex = &pg->vertices[v];
+		if (is_null_vertex(vertex))
+			continue;
+
+		rid = vertex->rid;
+		request_data = rt->requests[rid];
+		fprintf(out,
+"  r%" PRIu64 " [label=\"%s\\n(%" PRIu64 " hits in, %" PRIu64 " hits out)\"];\n",
+		    rid, request_data, vertex->total_nhits_in, vertex->total_nhits_out);
+	}
+
+	fprintf(out, "\n");
+
+	/* Link nodes */
+	for (size_t v = 0; v < pg->capvertices; v++) {
+		vertex = &pg->vertices[v];
+		if (is_null_vertex(vertex))
+			continue;
+
+		rid = vertex->rid;
+		for (size_t e = 0; e < vertex->nedges; e++) {
+			struct path_graph_edge *edge = &vertex->edges[e];
+			fprintf(out,
+"  r%" PRIu64 " -> r%" PRIu64 " [xlabel=\"%" PRIu64 "\"];\n",
+			    rid, edge->rid, edge->nhits);
+		}
+	}
+
+	fprintf(out, "}\n");
+}
+
+void
+finish_work_ctx(struct work_ctx *work_ctx)
 {
 	for (int tid = 0; tid < work_ctx->nthreads; tid++) {
 		int rc = pthread_join(work_ctx->thread[tid], NULL);
 		if (rc != 0)
 			ERR("%s", "pthread_join");
 	}
-}
-
-void
-cleanup_request_set(struct request_set *rs)
-{
-	for (size_t i = 0; i < REQUEST_SET_NBUCKETS; i++) {
-		struct request_set_entry *entry, *tmp;
-		HASH_ITER(hh, rs->handles[i], entry, tmp) {
-			HASH_DEL(rs->handles[i], entry);
-			free((void *)entry->data);
-			free(entry);
-		}
-
-		if (pthread_spin_destroy(&rs->locks[i]) != 0)
-			WARN("%s", "pthread_spin_destroy");
-	}
-}
-
-void
-cleanup_session_map(struct session_map *sm)
-{
-	for (int i = 0; i < SESSION_MAP_NBUCKETS; i++) {
-		struct session_map_entry *entry, *tmp;
-		HASH_ITER(hh, sm->handles[i], entry, tmp) {
-			HASH_DEL(sm->handles[i], entry);
-			free(entry);
-		}
-		int rc = pthread_spin_destroy(&sm->locks[i]);
-		if (rc != 0)
-			WARN("%s", "pthread_spin_destroy");
-	}
-}
-
-void
-cleanup_regex_info(struct regex_info *rx_info)
-{
-	assert(rx_info != NULL);
-
-	regfree(&rx_info->rfc3339);
-	regfree(&rx_info->ipv4);
-	regfree(&rx_info->request);
-	regfree(&rx_info->useragent);
-}
-
-void
-cleanup_log_view(struct log_view *log_view)
-{
-	if (munmap((char *)log_view->src, log_view->len) == -1)
-		WARN("%s", "munmap");
 }
 
 void
@@ -1245,11 +1265,13 @@ main(int argc, char **argv)
 	struct path_graph pg;
 
 	const char *output_path = "-";
+	const char *output_format = "dot-graph";
 	FILE *out = stdout;
 
 	while (1) {
 		int opt_idx = 0;
 		static struct option long_opts[] = {
+			{"format",          required_argument, 0, 'f' },
 			{"help",            no_argument,       0, 'h' },
 			{"ignore-patterns", required_argument, 0, 'I' },
 			{"merge-patterns",  required_argument, 0, 'M' },
@@ -1260,11 +1282,17 @@ main(int argc, char **argv)
 			{0,                 0,                 0,  0  }
 		};
 
-		int c = getopt_long(argc, argv, "hI:M:o:S:T:V", long_opts, &opt_idx);
+		int c = getopt_long(argc, argv, "f:hI:M:o:S:T:V", long_opts, &opt_idx);
 		if (c == -1)
 			break;
 
 		switch (c) {
+		case 'f':
+			if (strcmp(optarg, "dot-graph") == 0)
+				output_format = optarg;
+			else
+				ERRX("invalid output format: %s", optarg);
+			break;
 		case 'h':
 			usage();
 			break;
@@ -1317,27 +1345,29 @@ main(int argc, char **argv)
 	init_line_config(&lc, &log_view, &rx_info, session_fields);
 	init_request_set(&rs);
 	init_session_map(&sm);
-	init_path_graph(&pg);
 
 	/* Start worker threads */
 	init_work_ctx(&work_ctx, nthreads, &log_view, &lc, &rs, &sm);
 
 	/* Wait for worker threads to finish */
-	cleanup_work_ctx(&work_ctx);
+	finish_work_ctx(&work_ctx);
 
 	/* Do post-processing */
 	gen_request_table(&rt, &rs);
+	init_path_graph(&pg, &rt);
 	gen_path_graph(&pg, &rs, &sm);
 
-	debug_request_set(&rs);
-	debug_request_table(&rt);
-	debug_session_map(&sm);
-	debug_path_graph(&pg);
+	/* DEBUG */
+	//debug_request_set(&rs);
+	//debug_request_table(&rt);
+	//debug_session_map(&sm);
+	//debug_path_graph(&pg);
 
-	cleanup_request_set(&rs);
-	cleanup_session_map(&sm);
-	cleanup_regex_info(&rx_info);
-	cleanup_log_view(&log_view);
+	/* Write output */
+	if (strcmp(output_format, "dot-graph") == 0)
+		output_dot_graph(out, &pg, &rt);
+	else
+		ERRX("invalid output format: %s", output_format);
 
 	return 0;
 }
@@ -1407,7 +1437,7 @@ void
 debug_request_table(struct request_table *rt)
 {
 	printf("----- BEGIN REQUEST TABLE -----\n");
-	for (size_t i = REQUEST_ID_START; i < rt->nrequests + 1; i++)
+	for (size_t i = REQUEST_ID_START; i < rt->nrequests; i++)
 		printf("%-5zu %p \"%s\"\n", i, rt->requests[i], rt->requests[i]);
 	printf("----- END REQUEST TABLE -----\n");
 }
@@ -1453,28 +1483,22 @@ void
 debug_path_graph(struct path_graph *pg)
 {
 	printf("----- BEGIN PATH GRAPH -----\n");
-
-	printf("total_nedges: %" PRIu64 "\n", pg->total_nedges);
-	printf("total_nhits: %" PRIu64 "\n", pg->total_nhits);
-	printf("nstart_edges: %" PRIu64 "\n", pg->nstart_edges);
-
-	struct path_graph_vertex *vertex, *tmp;
-	size_t vertex_idx = 0;
-	HASH_ITER(hh, pg->vertices, vertex, tmp) {
-		printf("[%zu]:\n", vertex_idx);
-		printf("    request: %" PRIu64 "\n", vertex->rid);
-		printf("    is_start: %d\n", vertex->is_start);
-		printf("    nhits: %" PRIu64 "\n", vertex->nhits);
-		printf("    nedges: %zu\n", vertex->nedges);
-		printf("    lim_nedges: %zu\n", vertex->lim_nedges);
-		printf("    edges: %p\n", vertex->edges);
-		for (size_t i = 0; i < vertex->nedges; i++) {
-			struct path_graph_edge *edge = &vertex->edges[i];
-			printf("%8." PRIu64 " hits: %" PRIu64 "\n", edge->nhits, edge->rid);
+	printf("total_nedges: %zu\n", pg->total_nedges);
+	printf("nvertices: %zu\n", pg->nvertices);
+	printf("vertices:\n");
+	for (size_t v = 0; v < pg->capvertices; v++) {
+		struct path_graph_vertex *vertex = &pg->vertices[v];
+		if (is_null_vertex(vertex))
+			continue;
+		printf("    [%zu]:\n", v);
+		printf("        rid: %" PRIu64 "\n", vertex->rid);
+		printf("        nedges: %zu\n", vertex->nedges);
+		printf("        lim_nedges: %zu\n", vertex->lim_nedges);
+		printf("        edges: %p\n", vertex->edges);
+		for (size_t e = 0; e < vertex->nedges; e++) {
+			struct path_graph_edge *edge = &vertex->edges[e];
+			printf("            %" PRIu64 " (%" PRIu64 " hits)\n", edge->rid, edge->nhits);
 		}
-
-		vertex_idx++;
 	}
-
 	printf("----- END PATH GRAPH -----\n");
 }

@@ -10,7 +10,7 @@ CFLAGS=		-std=c99 \
 		-DHASH_DEBUG=1 \
 		-g3 \
 		-gdwarf-2 \
-		-O2
+		-O0
 
 CFLAGS_RELEASE=	-std=c99 \
 		-pedantic \

@@ -1,0 +1,11 @@
+digraph apathy_graph {
+  r0 [label="GET http://my-api/login\n(3 hits in, 3 hits out)"];
+  r1 [label="GET http://my-api/data\n(3 hits in, 2 hits out)"];
+  r2 [label="POST http://my-api/data\n(1 hits in, 0 hits out)"];
+  r3 [label="DELETE http://my-api/data\n(1 hits in, 0 hits out)"];
+  r4 [label="GET http://my-api/health\n(1 hits in, 0 hits out)"];
+
+  r0 -> r1 [xlabel="3"];
+  r1 -> r3 [xlabel="1"];
+  r1 -> r2 [xlabel="1"];
+}
