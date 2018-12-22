@@ -77,6 +77,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 
@@ -100,6 +101,11 @@
 #define VERSION "0.1.0"
 
 #define MIN(A, B) ((A) < (B) ? (A) : (B))
+
+#define ERR(fmt, ...) err(1, "error at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#define ERRX(fmt, ...) errx(1, "error at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#define WARN(fmt, ...) warn("warning at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
+#define WARNX(fmt, ...) warnx("warning at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 
 struct log_view {
 	size_t      len;  /* Size of log file plus one */
@@ -164,6 +170,7 @@ struct thread_chunk {
 /* Request-specific info, stored in a hash table. */
 struct request_set_entry {
 	char *data;
+
 	UT_hash_handle hh;
 };
 
@@ -178,9 +185,10 @@ struct request_set {
 struct session_map_entry {
 #define MAX_DEPTH 16
 	uint64_t  sid;                   /* Session ID */
-	int       nrequests;             /* Number of requests in session */
+	size_t    nrequests;             /* Number of requests in session */
 	uint64_t  timestamps[MAX_DEPTH]; /* Request timestamps */
 	char     *requests[MAX_DEPTH];   /* Request fields */
+
 	UT_hash_handle hh;
 };
 
@@ -191,19 +199,29 @@ struct session_map {
 	pthread_spinlock_t    locks[SESSION_MAP_NBUCKETS];
 };
 
-/* Aggregated path information. */
-struct path_entry {
-	size_t   nrequests;           /* Number of requests */
-	uint64_t nstarts;             /* Number of path starts */
-	char    *requests[MAX_DEPTH]; /* Request fields */
-	uint64_t hits[MAX_DEPTH];     /* Total hits up until each request */
-	/* TODO: average pauses, repeats */
+struct path_graph_edge {
+	char const *request; /* Outward request edge */
+	uint64_t    nhits;   /* Hits per this edge */
 };
 
-struct path_list {
-	size_t total_npaths;
-	size_t shared_npaths;
-	struct path_entry *paths;
+/* Path edge information. */
+struct path_graph_vertex {
+#define DEFAULT_NEDGES 8
+	//struct  path_graph_vertex_key key;
+	const char *request;                /* Request field */
+	int         is_start;               /* Is this a start vertex? */
+	uint64_t    nhits;                  /* Hits per this vertex */
+	size_t      nedges;                 /* Number of outward edges */
+	size_t      lim_nedges;             /* Edge buffer limit */
+	struct      path_graph_edge *edges; /* Outward edges */
+
+	UT_hash_handle hh;
+};
+
+struct path_graph {
+	uint64_t total_nedges;
+	uint64_t total_nhits;
+	struct path_graph_vertex *vertices;
 };
 
 /* Thread-specific context. */
@@ -256,6 +274,7 @@ struct field_view {
 
 void debug_request_set(struct request_set *);
 void debug_session_map(struct session_map *);
+void debug_path_graph(struct path_graph *);
 void usage(void);
 
 void *
@@ -268,15 +287,15 @@ mmap_file(const char *path, size_t *sizep)
 
 	int fd = open(path, O_RDONLY);
 	if (fd == -1)
-		err(1, "failed to open %s", path);
+		ERR( "failed to open file at '%s'", path);
 
 	if (fstat(fd, &sb) == -1)
-		err(1, "failed to read file status for %s", path);
+		ERR( "failed to read file status for %s", path);
 
 	*sizep = (size_t)sb.st_size;
 	void *p = mmap(NULL, (size_t)sb.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (p == MAP_FAILED)
-		err(1, "failed to map %s into memory", path);
+		ERR("failed to map %s into memory", path);
 
 	return p;
 }
@@ -293,7 +312,7 @@ compile_regex(regex_t *preg, const char *pattern)
 	rc = regcomp(preg, pattern, REG_EXTENDED | REG_NOSUB);
 	if (rc != 0) {
 		regerror(rc, preg, errbuf, sizeof(errbuf));
-		errx(1, "failed to compile regex '%s': %s\n", RFC3339_PATTERN,
+		ERRX("failed to compile regex '%s': %s", RFC3339_PATTERN,
 		    errbuf);
 	}
 }
@@ -530,15 +549,15 @@ void
 check_line_config(struct line_config *lc)
 {
 	if (lc->ip1 == -1 || lc->ip2 == -1)
-		warnx("warning: source and/or destination IP address fields not found");
+		WARNX("%s", "source and/or destination IP address fields not found");
 	if (lc->useragent == -1)
-		warnx("warning: user agent field not found");
+		WARNX("%s", "user agent field not found");
 	if (lc->ts_rfc3339 == -1)
-		warnx("error: timestamp field not found");
+		ERRX("%s", "timestamp field not found");
 	if (lc->request == -1)
-		errx(1, "error: request field not found");
+		ERRX("%s", "request field not found");
 	if (lc->ip1 == -1 && lc->ip2 == -1 && lc->useragent == -1)
-		errx(1, "error: source IP address, destination IP address nor user agent field found");
+		ERRX("%s", "source IP address, destination IP address nor user agent field found");
 }
 
 /*
@@ -658,7 +677,7 @@ add_request_set_entry(const char *src, struct request_set *rs)
 		case '\n':
 		case '\v':
 		case '\t':
-			errx(1, "error: unexpected whitespace or null terminator after request field: %.*s\n",
+			ERRX("unexpected whitespace or null terminator after request field: '%.*s'",
 			     req_len + 1, s);
 			/* NOTREACHED */
 			break;
@@ -677,7 +696,7 @@ effective_req:
 
 	rc = pthread_spin_lock(lock);
 	if (rc != 0)
-		err(1, "error: pthread_spin_lock");
+		ERR("%s", "pthread_spin_lock");
 
 	HASH_FIND(hh, *handlep, src, req_len, entry);
 	if (entry != NULL)
@@ -685,18 +704,18 @@ effective_req:
 
 	entry = calloc(1, sizeof(*entry));
 	if (entry == NULL)
-		err(1, "error: calloc");
+		ERR("%s", "calloc");
 
 	entry->data = calloc(1, req_len + 1);
 	if (entry->data == NULL)
-		err(1, "error: calloc");
+		ERR("%s", "calloc");
 	memcpy(entry->data, src, req_len);
 
 	HASH_ADD_KEYPTR(hh, *handlep, entry->data, req_len, entry);
 finish:
 	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
-		err(1, "error: pthread_spin_unlock");
+		ERR("%s", "pthread_spin_unlock");
 
 	return entry->data;
 }
@@ -722,18 +741,19 @@ amend_session_map_entry(struct session_map *sm, uint64_t sid, uint64_t ts, char 
 	bucket_idx = hash64_update(bucket_idx, (void *)&sid, sizeof(sid));
 	bucket_idx &= SESSION_MAP_BUCKET_MASK;
 
-	/* We have to use pointer to a pointer, otherwise the uthash
-	 * macros don't work as intended.  */
+	/*
+	 * We have to use pointer to a pointer, otherwise the uthash
+	 * macros don't work as intended.
+	 */
 	struct session_map_entry **handlep = &sm->handles[bucket_idx];
 	pthread_spinlock_t *lock = &sm->locks[bucket_idx];
 
 	rc = pthread_spin_lock(lock);
 	if (rc != 0)
-		err(1, "error: pthread_spin_lock");
+		ERR("%s", "pthread_spin_lock");
 
 	HASH_FIND_INT(*handlep, &sid, entry);
 	if (entry != NULL) {
-		//printf("found sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
 		if (entry->nrequests == MAX_DEPTH)
 			goto finish;
 		else
@@ -742,17 +762,11 @@ amend_session_map_entry(struct session_map *sm, uint64_t sid, uint64_t ts, char 
 
 	entry = calloc(1, sizeof(*entry));
 	if (entry == NULL)
-		err(1, "error: calloc");
+		ERR("%s", "calloc");
 	entry->sid = sid;
 	entry->nrequests = 0;
 
 	HASH_ADD_INT(*handlep, sid, entry);
-	//printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
-	//struct session_map_entry *tmp_se;
-	//HASH_FIND_INT(handle, &sid, tmp_se);
-	//if (tmp_se != NULL) {
-	//	printf("added sid %" PRIx64 " in bucket %zu\n", sid, bucket_idx);
-	//}
 amend:
 	i = entry->nrequests;
 	if (i == 0)
@@ -770,8 +784,10 @@ amend:
 	if (entry->requests[i] == re_data)
 		goto finish;
 
-	/* Shift the more recent requests up one index
-	 * to make room for the current request. */
+	/*
+	 * Shift the more recent requests up one index
+	 * to make room for the current request.
+	 */
 	int nmove = entry->nrequests - i;
 	memmove(&entry->timestamps[i + 1], &entry->timestamps[i],
 	    nmove * sizeof(entry->timestamps[0]));
@@ -784,7 +800,7 @@ first:
 finish:
 	rc = pthread_spin_unlock(lock);
 	if (rc != 0)
-		err(1, "error: pthread_spin_unlock");
+		ERR("%s", "pthread_spin_unlock");
 }
 
 void *
@@ -881,7 +897,7 @@ init_request_set(struct request_set *rs)
 	for (size_t i = 0; i< REQUEST_SET_NBUCKETS; i++) {
 		rs->handles[i] = NULL;
 		if (pthread_spin_init(&rs->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
-			err(1, "error: pthread_spin_init");
+			ERR("%s", "pthread_spin_init");
 	}
 }
 
@@ -891,8 +907,16 @@ init_session_map(struct session_map *sm)
 	for (size_t i = 0; i < SESSION_MAP_NBUCKETS; i++) {
 		sm->handles[i] = NULL;
 		if (pthread_spin_init(&sm->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
-			err(1, "error: pthread_spin_init");
+			ERR("%s", "pthread_spin_init");
 	}
+}
+
+void
+init_path_graph(struct path_graph *pg)
+{
+	pg->total_nedges = 0;
+	pg->total_nhits = 0;
+	pg->vertices = NULL;
 }
 
 void
@@ -925,7 +949,7 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view
 	}
 
 	if (nthreads > NTHREADS_MAX)
-		errx(1, "thread count must be under %d\n", NTHREADS_MAX);
+		ERRX("thread count must be under %d", NTHREADS_MAX);
 
 	assert(0 < nthreads && nthreads <= NTHREADS_MAX);
 
@@ -958,144 +982,113 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view
 		rc = pthread_create(&work_ctx->thread[tid], NULL, run_thread,
 		                    (void *)thread_ctx);
 		if (rc != 0)
-			err(1, "pthread_create");
+			ERR("%s", "pthread_create");
 	}
 }
 
-int
-cmp_path_entries_by_request_order(const void *p1, const void *p2)
-{
-	const struct path_entry *pe1 = p1;
-	const struct path_entry *pe2 = p2;
-	size_t ncmp = sizeof(pe1->requests) * sizeof(pe1->requests[0]);
-	return -(memcmp(pe1->requests, pe2->requests, ncmp));
-}
-
-/* Returns 1 if requests in `b` are contained in `a`. */
-int
-is_subpath(struct path_entry *a, struct path_entry *b)
-{
-	size_t min_nrequests = MIN(a->nrequests, b->nrequests);
-	size_t ncmp = min_nrequests * sizeof(a->requests[0]);
-	return b->nrequests <= a->nrequests
-	    && memcmp(a->requests, b->requests, ncmp) == 0;
-}
-
-/* Merges information in path entry `b` to `a`. */
 void
-merge_path_entries(struct path_entry *a, struct path_entry *b)
+amend_path_graph_vertex(struct path_graph *pg, const char *request, int is_start,
+                        const char *edge_request)
 {
-	assert(b->nrequests <= a->nrequests);
+	assert(pg != NULL);
+	assert(request != NULL);
 
-	for (size_t ri = 0; ri < b->nrequests; ri++) {
-		a->hits[ri] += b->hits[ri];
-		a->nstarts = a->hits[ri];
+	struct path_graph_edge *edge;
+
+	struct path_graph_vertex *vertex = NULL;
+	HASH_FIND(hh, pg->vertices, &request, sizeof(request), vertex);
+	if (vertex == NULL) {
+		vertex = calloc(1, sizeof(*vertex));
+		if (vertex == NULL)
+			ERR("%s", "calloc");
+
+		vertex->request = request;
+		vertex->is_start = is_start;
+		vertex->nhits = 1;
+		pg->total_nhits++;
+
+		vertex->edges = calloc(DEFAULT_NEDGES, sizeof(*vertex->edges));
+		fprintf(stderr, "vertex->edges = %p IN calloc(%d, %zu)\n", vertex->edges, DEFAULT_NEDGES, sizeof(*vertex->edges));
+		if (vertex->edges == NULL)
+			ERR("%s", "calloc");
+
+		vertex->lim_nedges = DEFAULT_NEDGES;
+		if (edge_request != NULL) {
+			vertex->nedges = 1;
+			edge = &vertex->edges[0];
+			edge->request = edge_request;
+			edge->nhits = 1;
+			pg->total_nedges++;
+		}
+
+		HASH_ADD(hh, pg->vertices, request, sizeof(request), vertex);
+
+		return;
 	}
-}
 
-int
-cmp_path_entries_by_start_count(const void *p1, const void *p2)
-{
-	const struct path_entry *pe1 = p1;
-	const struct path_entry *pe2 = p2;
-	if (pe1->nstarts == pe2->nstarts)
-		return pe1->nrequests <= pe2->nrequests;
-	else
-		return pe1->nstarts <= pe2->nstarts;
+	vertex->nhits++;
+	pg->total_nhits++;
+
+	if (edge_request == NULL)
+		return;
+
+	/* See if edge request already exists, if yes, increment hit count */
+	size_t edge_idx;
+	for (edge_idx = 0; edge_idx < vertex->nedges; edge_idx++) {
+		edge = &vertex->edges[edge_idx];
+		if (edge->request == edge_request) {
+			edge->nhits++;
+			return;
+		}
+	}
+
+	/* Resize edge buffer if needed */
+	if (vertex->nedges == vertex->lim_nedges) {
+		size_t new_lim = vertex->lim_nedges * 2;
+		/* TODO: overflow check */
+		size_t new_size = new_lim * sizeof(*vertex->edges);
+		struct path_graph_edge *new_edges = realloc(vertex->edges, new_size);
+		fprintf(stderr, "new_edges = %p IN realloc(vertex->edges = %p, new_lim = %zu)\n", new_edges, vertex->edges, new_lim);
+		if (new_edges == NULL)
+			ERR("%s", "realloc");
+		vertex->edges = new_edges;
+		vertex->lim_nedges = new_lim;
+	}
+
+	/* Set new edge at this point */
+	edge_idx = vertex->nedges;
+	edge = &vertex->edges[edge_idx];
+	edge->request = edge_request;
+	edge->nhits = 1;
+	vertex->nedges++;
+	pg->total_nedges++;
 }
 
 void
-gen_path_list(struct path_list *pl, struct request_set *rt,
+gen_path_graph(struct path_graph *pg, struct request_set *rs,
                struct session_map *sm)
 {
-	assert(rt != NULL);
+	assert(pg != NULL);
+	assert(rs != NULL);
 	assert(sm != NULL);
 
-	/* Compute total non-unique path count and allocate that many
-	 * path list nodes. */
-	size_t total_npaths = 0;
-	for (size_t i = 0; i < SESSION_MAP_NBUCKETS; i++)
-		total_npaths += HASH_COUNT(sm->handles[i]);
-
-	pl->paths = calloc(total_npaths, sizeof(pl->paths[0]));
-	if (pl->paths == NULL)
-		err(1, "error: calloc");
-	pl->total_npaths = total_npaths;
-
-	/*
-	 * Initialize newly allocated path list nodes
-	 * with each session's request hit counts set to 1.
-	 */
-	size_t pi = 0;
-	for (size_t bi = 0; bi < SESSION_MAP_NBUCKETS; bi++) {
-		struct session_map_entry *se, *tmp;
-		HASH_ITER(hh, sm->handles[bi], se, tmp) {
-			struct path_entry *pe = &pl->paths[pi];
-			pe->nrequests = se->nrequests;
-			for (size_t ri = 0; ri < pe->nrequests; ri++) {
-				pe->requests[ri] = se->requests[ri];
-				pe->nstarts = 1;
-				pe->hits[ri] = 1;
+	for (size_t bucket_idx = 0; bucket_idx < SESSION_MAP_NBUCKETS;
+	     bucket_idx++) {
+		struct session_map_entry *entry, *tmp;
+		HASH_ITER(hh, sm->handles[bucket_idx], entry, tmp) {
+			for (size_t request_idx = 0, edge_idx = 1;
+			     request_idx < entry->nrequests;
+			     request_idx++, edge_idx++) {
+				char *request = entry->requests[request_idx];
+				int is_start = request_idx == 0;
+				char *edge_request = edge_idx < entry->nrequests
+				                   ? entry->requests[edge_idx]
+						   : NULL;
+				amend_path_graph_vertex(pg, request, is_start,
+				    edge_request);
 			}
-			pi++;
 		}
 	}
-
-	/* Sort path list nodes according to request pointer layout */
-	qsort(pl->paths, pl->total_npaths, sizeof(pl->paths[0]),
-	    cmp_path_entries_by_request_order);
-
-	/* At this point, we can merge subsequent path chains into one. */
-	size_t pi_start = 0;
-	size_t pi_end = 1;
-	size_t shared_npaths = 1;
-	while (pi_end < total_npaths) {
-		struct path_entry *pe_start = &pl->paths[pi_start];
-		struct path_entry *pe_end = &pl->paths[pi_end];
-
-		if (is_subpath(pe_start, pe_end)) {
-			merge_path_entries(pe_start, pe_end);
-			pi_end++;
-		} else {
-			pi_start = pi_end;
-			pi_end++;
-			pl->paths[shared_npaths - 1] = *pe_start;
-			shared_npaths++;
-		}
-	}
-
-	pl->shared_npaths = shared_npaths;
-
-	/* Finally sort by start counts. */
-	qsort(pl->paths, pl->shared_npaths, sizeof(pl->paths[0]),
-	    cmp_path_entries_by_start_count);
-}
-
-void
-output_yaml(struct path_list *pl, FILE *out)
-{
-	fprintf(out, "---\n");
-
-	fprintf(out,
-"unique_sessions: %zu\n"
-"shared_paths: %zu\n"
-"paths:\n", pl->total_npaths, pl->shared_npaths);
-
-	for (size_t pi = 0; pi < pl->shared_npaths; pi++) {
-		struct path_entry *pe = &pl->paths[pi];
-		fprintf(out,
-"    - %zu:\n"
-"        - starts: %" PRIu64 "\n"
-"        - requests:\n", pi + 1, pe->nstarts);
-		for (size_t ri = 0; ri < pe->nrequests; ri++) {
-			char *re_data = pe->requests[ri];
-			fprintf(out,
-"            - %s\n"
-"                - hits: %" PRIu64 "\n", re_data, pe->hits[ri]);
-		}
-	}
-
-	fprintf(out, "...\n");
 }
 
 void
@@ -1104,7 +1097,7 @@ cleanup_work_ctx(struct work_ctx *work_ctx)
 	for (int tid = 0; tid < work_ctx->nthreads; tid++) {
 		int rc = pthread_join(work_ctx->thread[tid], NULL);
 		if (rc != 0)
-			err(1, "pthread_join");
+			ERR("%s", "pthread_join");
 	}
 }
 
@@ -1120,7 +1113,7 @@ cleanup_request_set(struct request_set *rs)
 		}
 
 		if (pthread_spin_destroy(&rs->locks[i]) != 0)
-			warn("warning: pthread_spin_destroy");
+			WARN("%s", "pthread_spin_destroy");
 	}
 }
 
@@ -1135,7 +1128,7 @@ cleanup_session_map(struct session_map *sm)
 		}
 		int rc = pthread_spin_destroy(&sm->locks[i]);
 		if (rc != 0)
-			warn("warning: pthread_spin_destroy");
+			WARN("%s", "pthread_spin_destroy");
 	}
 }
 
@@ -1154,7 +1147,7 @@ void
 cleanup_log_view(struct log_view *log_view)
 {
 	if (munmap((char *)log_view->src, log_view->len) == -1)
-		warn("munmap");
+		WARN("%s", "munmap");
 }
 
 void
@@ -1188,12 +1181,12 @@ main(int argc, char **argv)
 	struct log_view log_view;
 	struct regex_info rx_info;
 	struct line_config lc;
-	struct request_set rt;
+	struct request_set rs;
 	struct session_map sm;
 	struct work_ctx work_ctx;
 
 	/* Post-processing data */
-	struct path_list pl;
+	struct path_graph pg;
 
 	const char *output_path = "-";
 	FILE *out = stdout;
@@ -1232,7 +1225,7 @@ main(int argc, char **argv)
 			if (strcmp(output_path, "-") != 0) {
 				out = fopen(output_path, "w");
 				if (out == NULL)
-					err(1, "failed to create output file at %s", output_path);
+					ERR("failed to create output file at '%s'", output_path);
 			}
 			break;
 		case 'S':
@@ -1244,7 +1237,7 @@ main(int argc, char **argv)
 			if (nthreads == 0
 		         || nthreads > INT_MAX
 			 || nthreads < INT_MIN)
-				errx(1, "invalid thread count: %s", optarg);
+				ERRX("invalid thread count: %s", optarg);
 			break;
 
 		case 'V':
@@ -1259,30 +1252,31 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 	if (argc == 0)
-		errx(1, "missing access log");
+		ERRX("%s", "missing access log");
 	if (argc > 1)
-		errx(1, "only one access log allowed");
+		ERRX("%s", "only one access log allowed");
 
 	init_log_view(&log_view, argv[0]);
 	init_regex_info(&rx_info);
 	init_line_config(&lc, &log_view, &rx_info, session_fields);
-	init_request_set(&rt);
+	init_request_set(&rs);
 	init_session_map(&sm);
+	init_path_graph(&pg);
 
 	/* Start worker threads */
-	init_work_ctx(&work_ctx, nthreads, &log_view, &lc, &rt, &sm);
+	init_work_ctx(&work_ctx, nthreads, &log_view, &lc, &rs, &sm);
 
 	/* Wait for worker threads to finish */
 	cleanup_work_ctx(&work_ctx);
 
 	/* Do post-processing */
-	gen_path_list(&pl, &rt, &sm);
-	output_yaml(&pl, out);
+	gen_path_graph(&pg, &rs, &sm);
 
 	//debug_request_set(&rt);
-	//debug_session_table(&st);
+	//debug_session_map(&sm);
+	debug_path_graph(&pg);
 
-	cleanup_request_set(&rt);
+	cleanup_request_set(&rs);
 	cleanup_session_map(&sm);
 	cleanup_regex_info(&rx_info);
 	cleanup_log_view(&log_view);
@@ -1351,6 +1345,17 @@ debug_request_set(struct request_set *rs)
 	printf("----- END REQUEST TABLE -----\n");
 }
 
+///* Session-specific information, stored in a hash table. */
+//struct session_map_entry {
+//#define MAX_DEPTH 16
+//	uint64_t  sid;                   /* Session ID */
+//	size_t    nrequests;             /* Number of requests in session */
+//	uint64_t  timestamps[MAX_DEPTH]; /* Request timestamps */
+//	char     *requests[MAX_DEPTH];   /* Request fields */
+//
+//	UT_hash_handle hh;
+//};
+
 void
 debug_session_map(struct session_map *sm)
 {
@@ -1370,17 +1375,50 @@ debug_session_map(struct session_map *sm)
 	printf("max_bucket_count: %" PRIu64 "\n", max_bucket_count);
 	printf("avg_bucket_count: %lf\n", (double)total_count / SESSION_MAP_NBUCKETS);
 	printf("total_count: %" PRIu64 "\n", total_count);
-	//for (int i = 0; i < SESSION_MAP_NBUCKETS; i++) {
-	//	struct session_map_entry *se, *tmp;
-	//	HASH_ITER(hh, sm->handles[i], se, tmp) {
-	//		printf("%016" PRIx64 ":\n", se->sid);
-	//		for (int i = 0; i < se->nrequests; i++) {
-	//			printf("    %" PRIu64 " %p %s (%"PRIu64" repeats)\n",
-	//			       se->timestamps[i] / 1000, se->requests[i],
-        //	                       se->requests[i], se->repeats[i]);
-	//		}
-	//	}
-	//	printf("\n");
-	//}
+	size_t session_idx = 0;
+	for (size_t bucket_idx = 0; bucket_idx < SESSION_MAP_NBUCKETS; bucket_idx++) {
+		struct session_map_entry *entry, *tmp;
+		HASH_ITER(hh, sm->handles[bucket_idx], entry, tmp) {
+			printf("[%zu]:\n", session_idx);
+			printf("    sid: %016" PRIx64 "\n", entry->sid);
+			printf("    nrequests: %zu\n", entry->nrequests);
+			printf("    requests: %p\n", entry->requests);
+			for (size_t i = 0; i < entry->nrequests; i++) {
+				printf("        %" PRIu64 " %p %s\n",
+				       entry->timestamps[i] / 1000, entry->requests[i],
+        	                       entry->requests[i]);
+			}
+			session_idx++;
+		}
+	}
 	printf("----- END SESSION TABLE -----\n");
+}
+
+void
+debug_path_graph(struct path_graph *pg)
+{
+	printf("----- BEGIN PATH GRAPH -----\n");
+
+	printf("total_nedges: %" PRIu64 "\n", pg->total_nedges);
+	printf("total_nhits: %" PRIu64 "\n", pg->total_nhits);
+
+	struct path_graph_vertex *vertex, *tmp;
+	size_t vertex_idx = 0;
+	HASH_ITER(hh, pg->vertices, vertex, tmp) {
+		printf("[%zu]:\n", vertex_idx);
+		printf("    request: %p %s\n", vertex->request, vertex->request);
+		printf("    is_start: %d\n", vertex->is_start);
+		printf("    nhits: %" PRIu64 "\n", vertex->nhits);
+		printf("    nedges: %zu\n", vertex->nedges);
+		printf("    lim_nedges: %zu\n", vertex->lim_nedges);
+		printf("    edges: %p\n", vertex->edges);
+		for (size_t i = 0; i < vertex->nedges; i++) {
+			struct path_graph_edge *edge = &vertex->edges[i];
+			printf("%8." PRIu64 " hits: %p %s\n", edge->nhits, edge->request, edge->request);
+		}
+
+		vertex_idx++;
+	}
+
+	printf("----- END PATH GRAPH -----\n");
 }

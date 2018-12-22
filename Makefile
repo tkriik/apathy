@@ -1,15 +1,15 @@
-CC=		cc
+CC=		clang
 
 CFLAGS=		-std=c99 \
-		-pedantic \
 		-Wall \
 		-Wextra \
 		-Wno-overlength-strings \
 		-Wno-format \
 		-Wno-unused-variable \
-		-Wno-unused-but-set-variable \
 		-D_DEFAULT_SOURCE \
+		-DHASH_DEBUG=1 \
 		-g3 \
+		-gdwarf-2 \
 		-O2
 
 CFLAGS_RELEASE=	-std=c99 \
