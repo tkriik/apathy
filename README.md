@@ -15,8 +15,7 @@ This tool is used to trace HTTP request paths from access logs,
 which can be useful when designing load tests or just figuring out
 how other people or systems are using a specific web service.
 
-For example, supposed you had an access log with following lines
-in a file named `example.log`:
+For example, we have the following dummy access log at `examples/simple.log`:
 
     2018-12-12T12:00:01.000Z 127.0.0.10:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 1"
     2018-12-12T12:00:02.000Z 127.0.0.20:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 2"
@@ -30,9 +29,9 @@ in a file named `example.log`:
 
 Running the command below...
 
-    $ apathy -o example.dot example.log
+    $ apathy -o examples/simple.dot examples/simple.log
 
-...would produce the following `dot` -formatted file named `example.dot`:
+...would produce the following `dot` -formatted file in `examples/simple.dot`:
 
     digraph apathy_graph {
       r0 [label="GET http://my-api/login\n(3 hits in, 3 hits out)"];
@@ -49,9 +48,9 @@ Running the command below...
 
 Now we can, for example, use the `graphviz` tool to transform it into a PNG image:
 
-    $ sfdp -x -Goverlap=scale -Tpng example.dot -o example.png
+    $ sfdp -x -Goverlap=scale -Tpng examples/simple.dot -o examples/simple.png
 
-![alt text](example.png)
+![alt text](examples/simple.png)
 
 From the image we can observe the following facts:
 

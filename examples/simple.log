@@ -7,5 +7,3 @@
 2018-12-12T12:00:07.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 3"
 2018-12-12T12:00:08.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/data" "Mozilla/5.0 USERAGENT 3"
 2018-12-12T12:00:09.000Z 127.0.0.90:5000 127.0.0.1:80 "GET http://my-api/health" "httpkit"
-2018-12-12T12:00:10.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/token/37bd1951-91e0-43ea-a313-ba3074e46ec7/data/131b0ae8-b7df-4d4d-a35c-5b10d1948de3" "USERAGENT 3"
-
