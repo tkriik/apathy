@@ -26,7 +26,7 @@
  *    data, such as log information, line configuration, request and session
  *    tables etc.
  *
- *    - init_work_ctx()
+ *    - start_work_ctx()
  *
  * -----------------------------------------------------------------------------
  *
@@ -100,17 +100,18 @@
 
 #define VERSION "0.1.0"
 
-#define MIN(A, B) ((A) < (B) ? (A) : (B))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define ERR(fmt, ...) err(1, "error at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #define ERRX(fmt, ...) errx(1, "error at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #define WARN(fmt, ...) warn("warning at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 #define WARNX(fmt, ...) warnx("warning at %s:%d (%s): " fmt, __FILE__, __LINE__, __func__, ##__VA_ARGS__)
 
-struct log_view {
-	size_t      len;  /* Size of log file plus one */
-	const char *path; /* Path to log file */
-	const char *src;  /* Memory-mapped log contents */
+struct file_view {
+	size_t      size; /* Size of file plus one */
+	const char *path; /* Path to file */
+	char       *src;  /* Memory-mapped file contents */
 };
 
 enum field_type {
@@ -160,6 +161,16 @@ struct line_config {
 	const char *sfields;
 };
 
+struct truncate_patterns {
+#define TRUNCATE_NPATTERNS_MAX 512
+	int         npatterns;
+	regex_t     regexes[TRUNCATE_NPATTERNS_MAX];
+	const char *patterns[TRUNCATE_NPATTERNS_MAX];
+	const char *aliases[TRUNCATE_NPATTERNS_MAX];
+	size_t      alias_sizes[TRUNCATE_NPATTERNS_MAX];
+	size_t      max_alias_size;
+};
+
 /* Working area for one thread. */
 struct thread_chunk {
 	size_t      size;
@@ -168,6 +179,7 @@ struct thread_chunk {
 };
 
 typedef size_t request_id_t;
+#define PRIuRID "zu"
 
 /* Request field data and incremental ID, stored in a hash table. */
 struct request_set_entry {
@@ -187,7 +199,7 @@ struct request_set {
 #define REQUEST_ID_INVAL UINT64_MAX
 #define REQUEST_ID_START 0
 	pthread_spinlock_t        rid_lock;
-	request_id_t              rid_ctr;    /* Incremental request ID */
+	request_id_t              rid_ctr; /* Incremental request ID */
 };
 
 /* Mapping from incremental request IDs to request strings. */
@@ -197,6 +209,7 @@ struct request_table {
 };
 
 typedef uint64_t session_id_t;
+#define PRIuSID PRIu64
 
 /* Session-specific information, stored in a hash table. */
 struct session_map_entry {
@@ -234,7 +247,7 @@ struct path_graph_vertex {
 	uint64_t     total_nhits_out;        /* Total number of hits from this vertex */
 };
 
-const struct path_graph_vertex NULL_VERTEX = {
+static const struct path_graph_vertex NULL_VERTEX = {
 	.rid             = REQUEST_ID_INVAL,
 	.nedges          = 0,
 	.lim_nedges      = 0,
@@ -254,8 +267,9 @@ struct path_graph {
 struct thread_ctx {
 	int    id;
 
-	struct log_view *log_view;
+	struct file_view *log_view;
 	struct line_config *line_config;
+	struct truncate_patterns *truncate_patterns;
 	struct thread_chunk chunk;
 	struct request_set *request_set;
 	struct session_map *session_map;
@@ -298,6 +312,7 @@ struct field_view {
 	const char *src;
 };
 
+void debug_truncate_patterns(struct truncate_patterns *);
 void debug_request_set(struct request_set *);
 void debug_request_table(struct request_table *);
 void debug_session_map(struct session_map *);
@@ -305,7 +320,7 @@ void debug_path_graph(struct path_graph *);
 void usage(void);
 
 void *
-mmap_file(const char *path, size_t *sizep)
+mmap_file(const char *path, size_t *sizep, int prot)
 {
 	assert(path != NULL);
 	assert(sizep != NULL);
@@ -320,7 +335,7 @@ mmap_file(const char *path, size_t *sizep)
 		ERR( "failed to read file status for %s", path);
 
 	*sizep = (size_t)sb.st_size;
-	void *p = mmap(NULL, (size_t)sb.st_size + 1, PROT_READ, MAP_PRIVATE, fd, 0);
+	void *p = mmap(NULL, (size_t)sb.st_size + 1, prot, MAP_PRIVATE, fd, 0);
 	if (p == MAP_FAILED)
 		ERR("failed to map %s into memory", path);
 
@@ -328,7 +343,7 @@ mmap_file(const char *path, size_t *sizep)
 }
 
 void
-compile_regex(regex_t *preg, const char *pattern)
+compile_regex(regex_t *preg, const char *pattern, int cflags)
 {
 	assert(preg != NULL);
 	assert(pattern != NULL);
@@ -336,11 +351,10 @@ compile_regex(regex_t *preg, const char *pattern)
 	int rc;
 	char errbuf[256] = {0};
 
-	rc = regcomp(preg, pattern, REG_EXTENDED | REG_NOSUB);
+	rc = regcomp(preg, pattern, cflags);
 	if (rc != 0) {
 		regerror(rc, preg, errbuf, sizeof(errbuf));
-		ERRX("failed to compile regex '%s': %s", RFC3339_PATTERN,
-		    errbuf);
+		ERRX("failed to compile regex '%s': %s", pattern, errbuf);
 	}
 }
 
@@ -472,10 +486,127 @@ fill_fields:
 }
 
 void
-init_log_view(struct log_view *ctx, const char *path)
+init_file_view_readonly(struct file_view *file_view, const char *path)
 {
-	ctx->src = mmap_file(path, &ctx->len);
-	ctx->path = path;
+	file_view->src = mmap_file(path, &file_view->size, PROT_READ);
+	file_view->path = path;
+}
+
+void
+init_file_view_readwrite(struct file_view *file_view, const char *path)
+{
+	file_view->src = mmap_file(path, &file_view->size, PROT_READ | PROT_WRITE);
+	file_view->path = path;
+}
+
+char *
+trim_line(char *src, size_t *line_sizep)
+{
+	assert(src != NULL);
+	assert(line_sizep != NULL);
+
+	char *line = src;
+	while (isspace(*line))
+		*line++ = '\0';
+
+	size_t line_size = strcspn(line, "\n");
+	line[line_size] = '\0';
+	for (size_t i = line_size - 1; 0 < i; i--) {
+		if (isspace(line[i])) {
+			line[i] = '\0';
+		} else
+			break;
+	}
+
+	*line_sizep = line_size;
+
+	assert(!isspace(*line) && !isspace(line[line_size - 1]));
+
+	return line;
+}
+
+int
+is_comment_line(const char *line)
+{
+	assert(line != NULL);
+
+	return *line == '#';
+}
+
+void
+get_pattern_alias(char *line, const char **aliasp, const char **pattern_linep)
+{
+	assert(line != NULL);
+	assert(*line != '\0' && !isspace(*line));
+	assert(aliasp != NULL);
+	assert(pattern_linep != NULL);
+
+	*aliasp = line;
+
+	if (*line != '$') {
+		*pattern_linep = line;
+		return;
+	}
+
+	size_t alias_size = 0;
+	char c;
+	char *s = line;
+	while ((c = *s++) != '\0' && (!isspace(c) && c != '='))
+		alias_size++;
+	line[alias_size] = '\0';
+
+	size_t sep_size = 1;
+	while ((c = *s++) != '\0' && (isspace(c) || c == '='))
+		sep_size++;
+	*pattern_linep = line + alias_size + sep_size;
+}
+
+void
+init_truncate_patterns(struct truncate_patterns *tp, const char *path)
+{
+	assert(tp != NULL);
+	assert(path != NULL);
+
+	struct file_view file_view;
+	init_file_view_readwrite(&file_view, path);
+
+	tp->npatterns = 0;
+	tp->max_alias_size = 0;
+
+	size_t size = file_view.size;
+	char *src = file_view.src;
+	char *line = src;
+	while (*line != '\0' && tp->npatterns < TRUNCATE_NPATTERNS_MAX) {
+		size_t line_size;
+		line = trim_line(line, &line_size);
+
+		if (line_size == 0) {
+			line += line_size + 1;
+			continue;
+		}
+
+		if (is_comment_line(line)) {
+			line += line_size + 1;
+			continue;
+		}
+
+		const char *alias;
+		const char *pattern;
+		get_pattern_alias(line, &alias, &pattern);
+
+		regex_t regex = {0};
+		int cflags = REG_EXTENDED | REG_NEWLINE;
+		compile_regex(&regex, pattern, cflags);
+		tp->regexes[tp->npatterns] = regex;
+		tp->patterns[tp->npatterns] = pattern;
+		tp->aliases[tp->npatterns] = alias;
+		size_t alias_size = strlen(alias);
+		tp->alias_sizes[tp->npatterns] = alias_size;
+		tp->max_alias_size = MAX(alias_size, tp->max_alias_size);
+		tp->npatterns++;
+
+		line += line_size + 1;
+	}
 }
 
 void
@@ -483,10 +614,11 @@ init_regex_info(struct regex_info *rx_info)
 {
 	assert(rx_info != NULL);
 
-	compile_regex(&rx_info->rfc3339, RFC3339_PATTERN);
-	compile_regex(&rx_info->ipv4, IPV4_PATTERN);
-	compile_regex(&rx_info->request, REQUEST_PATTERN);
-	compile_regex(&rx_info->useragent, USERAGENT_PATTERN);
+	int cflags = REG_EXTENDED | REG_NOSUB | REG_NEWLINE;
+	compile_regex(&rx_info->rfc3339, RFC3339_PATTERN, cflags);
+	compile_regex(&rx_info->ipv4, IPV4_PATTERN, cflags);
+	compile_regex(&rx_info->request, REQUEST_PATTERN, cflags);
+	compile_regex(&rx_info->useragent, USERAGENT_PATTERN, cflags);
 }
 
 int
@@ -494,6 +626,12 @@ regex_does_match(regex_t *preg, const char *s)
 {
 	regmatch_t pmatch[1];
 	return regexec(preg, s, 1, pmatch, 0) == 0;
+}
+
+int
+get_regex_matches(regex_t *preg, const char *s, regmatch_t *matches, size_t nmatches)
+{
+	return regexec(preg, s, nmatches, matches, 0);
 }
 
 enum field_type
@@ -671,12 +809,73 @@ hash64_update_char(uint64_t hash, char c)
 	return (hash ^ c) * FNV_PRIME64;
 }
 
+#define REQUEST_NTRUNCS_MAX 8
+size_t
+truncate_raw_request(char *trunc_buf, size_t trunc_buf_size,
+    const char *raw_buf, size_t raw_buf_size, struct truncate_patterns *tp)
+{
+	assert(trunc_buf != NULL);
+	assert(raw_buf != NULL);
+	assert(tp != NULL);
+
+	memset(trunc_buf, '\0', trunc_buf_size);
+	size_t trunc_size = 0;
+
+	int pattern_idx = -1;
+	int npatterns = tp->npatterns;
+	regex_t *regex = NULL;
+	const char *pattern = NULL;
+	const char *alias = NULL;
+	size_t alias_size = 0;
+	regmatch_t matches[1];
+	for (int p = 0; p < npatterns; p++) {
+		regex = &tp->regexes[p];
+		pattern = tp->patterns[p];
+		alias = tp->aliases[p];
+		if (get_regex_matches(regex, raw_buf, matches, 1) == REG_NOMATCH)
+			continue;
+		pattern_idx = p;
+		break;
+	}
+
+	if (pattern_idx == -1) {
+		memcpy(trunc_buf, raw_buf, raw_buf_size);
+		return raw_buf_size;
+	}
+
+	assert(regex != NULL);
+	assert(pattern != NULL);
+	assert(alias != NULL);
+
+	regmatch_t *match = &matches[0];
+	alias_size = tp->alias_sizes[pattern_idx];
+	size_t end_offset;
+	do {
+		assert(match->rm_so != -1);
+
+		size_t start_offset = match->rm_so;
+		end_offset = match->rm_eo;
+		size_t match_size = end_offset - start_offset;
+
+		memcpy(trunc_buf + trunc_size, raw_buf, start_offset);
+		trunc_size += start_offset;
+
+		memcpy(trunc_buf + trunc_size, alias, alias_size);
+		trunc_size += alias_size;
+
+		raw_buf += end_offset;
+	} while (get_regex_matches(regex, raw_buf, matches, 1) != REG_NOMATCH);
+
+	assert(trunc_size == strlen(trunc_buf));
+	return trunc_size;
+}
 /*
  * Stores a request field pointed to by src into the request set rs.
  * Returns a numeric request ID.
  */
 request_id_t
-add_request_set_entry(struct request_set *rs, const char *src)
+add_request_set_entry(struct request_set *rs, const char *src,
+                      struct truncate_patterns *tp)
 {
 	assert(src != NULL);
 
@@ -685,46 +884,40 @@ add_request_set_entry(struct request_set *rs, const char *src)
 	pthread_spinlock_t *bucket_lock;
 	struct request_set_entry *entry;
 
-	int rc;
+	/* Compute request field length */
 	const char *s = src;
-	int req_len = 0;
-	int spaces_remaining = 2;
-	while (0 < spaces_remaining) {
-		char c = *s++;
-		switch (c) {
-		case ' ':
-			spaces_remaining--;
-			break;
-		case '?':
-		case '"':
-			req_len++;
-			goto effective_req;
-		case '\0':
-		case '\n':
-		case '\v':
-		case '\t':
-			ERRX("unexpected whitespace or null terminator after request field: '%.*s'",
-			     req_len + 1, s);
-			/* NOTREACHED */
-			break;
-		default:
-			bucket_idx = hash64_update_char(bucket_idx, c);
-			req_len++;
-			break;
-		}
-	}
+	size_t method_size = strcspn(s, " ");
+	s += method_size + 1;
+	size_t sep_size = strspn(s, " \t\v");
+	s += sep_size + 1;
+	size_t url_size = strcspn(s, "?\" \n");
 
-effective_req:
+	size_t req_len = method_size + sep_size + url_size + 2;
+
+#define REQUEST_LEN_MAX 4096
+	if (REQUEST_LEN_MAX < req_len)
+		WARNX("truncating request over %d bytes long", REQUEST_LEN_MAX);
+	req_len = MIN(req_len, REQUEST_LEN_MAX);
+
+
+	char raw_buf[req_len + 1];
+	memcpy(raw_buf, src, req_len);
+	raw_buf[req_len] = '\0';
+
+	char trunc_buf[req_len + tp->max_alias_size * REQUEST_NTRUNCS_MAX + 1];
+	size_t trunc_size = truncate_raw_request(trunc_buf, sizeof(trunc_buf) - 1,
+	    raw_buf, req_len, tp);
+
+	bucket_idx = hash64_update(bucket_idx, trunc_buf, trunc_size);
 	bucket_idx &= REQUEST_SET_BUCKET_MASK;
 	handlep = &rs->handles[bucket_idx];
 	bucket_lock = &rs->locks[bucket_idx];
 	entry = NULL;
 
-	rc = pthread_spin_lock(bucket_lock);
-	if (rc != 0)
+	if (pthread_spin_lock(bucket_lock) != 0)
 		ERR("%s", "pthread_spin_lock");
 
-	HASH_FIND(hh, *handlep, src, req_len, entry);
+	HASH_FIND(hh, *handlep, trunc_buf, trunc_size, entry);
 	if (entry != NULL)
 		goto finish;
 
@@ -732,10 +925,10 @@ effective_req:
 	if (entry == NULL)
 		ERR("%s", "calloc");
 
-	entry->data = calloc(1, req_len + 1);
+	entry->data = calloc(1, trunc_size + 1);
 	if (entry->data == NULL)
 		ERR("%s", "calloc");
-	memcpy((char *)entry->data, src, req_len);
+	memcpy((char *)entry->data, trunc_buf, trunc_size);
 
 	if (pthread_spin_lock(&rs->rid_lock) != 0)
 		ERR("%s", "pthread_spin_lock");
@@ -744,12 +937,11 @@ effective_req:
 	if (pthread_spin_unlock(&rs->rid_lock) != 0)
 		ERR("%s", "pthread_spin_unlock");
 
-	HASH_ADD_KEYPTR(hh, *handlep, entry->data, req_len, entry);
+	HASH_ADD_KEYPTR(hh, *handlep, entry->data, trunc_size, entry);
 	rs->nrequests++;
 
 finish:
-	rc = pthread_spin_unlock(bucket_lock);
-	if (rc != 0)
+	if (pthread_spin_unlock(bucket_lock) != 0)
 		ERR("%s", "pthread_spin_unlock");
 
 	return entry->rid;
@@ -844,7 +1036,8 @@ run_thread(void *ctx)
 	assert(ctx != NULL);
 
 	struct thread_ctx *thread_ctx = ctx;
-	struct log_view *log_view = thread_ctx->log_view;
+	struct file_view *log_view = thread_ctx->log_view;
+	struct truncate_patterns *tp = thread_ctx->truncate_patterns;
 	const char *src = thread_ctx->chunk.start;
 	struct line_config *lc = thread_ctx->line_config;
 	struct request_set *rs = thread_ctx->request_set;
@@ -869,15 +1062,16 @@ run_thread(void *ctx)
 			struct field_idx *fidx = &lc->indices[i];
 			struct field_view *fv = &fvs[fidx->i];
 
-			if (fidx->is_session)
+			if (fidx->is_session) {
 				sid = hash64_update(sid, fv->src, fv->len);
+			}
 
 			switch (fidx->type) {
 			case FIELD_TS_RFC3339:
 				ts = ts_rfc3339_to_ms(fv->src);
 				break;
 			case FIELD_REQUEST:
-				rid = add_request_set_entry(rs, fv->src);
+				rid = add_request_set_entry(rs, fv->src, tp);
 				break;
 			default:
 				break;
@@ -891,7 +1085,7 @@ run_thread(void *ctx)
 }
 
 void
-init_line_config(struct line_config *lc, struct log_view *log_view,
+init_line_config(struct line_config *lc, struct file_view *log_view,
 		 struct regex_info *rx_info, const char *session_fields)
 {
 	assert(lc != NULL);
@@ -970,12 +1164,13 @@ init_path_graph(struct path_graph *pg, struct request_table *rt)
 }
 
 void
-init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view,
-              struct line_config *lc, struct request_set *rs,
-	      struct session_map *sm)
+start_work_ctx(struct work_ctx *work_ctx, int nthreads, struct file_view *log_view,
+               struct truncate_patterns *tp, struct line_config *lc,
+	       struct request_set *rs, struct session_map *sm)
 {
 	assert(work_ctx != NULL);
 	assert(log_view != NULL);
+	assert(tp != NULL);
 	assert(lc != NULL);
 	assert(rs != NULL);
 	assert(sm != NULL);
@@ -984,7 +1179,7 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view
 
 #define MT_THRESHOLD (4 * 1024 * 1024)
 	/* If log size is under MT_THRESHOLD, use one thread. */
-	if (log_view->len < MT_THRESHOLD)
+	if (log_view->size < MT_THRESHOLD)
 		nthreads = 1;
 	else if (nthreads == -1) {
 		nthreads = 1;
@@ -1005,8 +1200,8 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view
 
 	work_ctx->nthreads = nthreads;
 
-	size_t chunk_size = log_view->len / nthreads;
-	size_t chunk_rem = log_view->len % nthreads;
+	size_t chunk_size = log_view->size / nthreads;
+	size_t chunk_rem = log_view->size % nthreads;
 	for (int tid = 0; tid < nthreads; tid++) {
 		size_t start_offset;
 		size_t end_offset;
@@ -1020,14 +1215,15 @@ init_work_ctx(struct work_ctx *work_ctx, int nthreads, struct log_view *log_view
 
 		thread_ctx = &work_ctx->thread_ctx[tid];
 
-		thread_ctx->log_view    = log_view;
-		thread_ctx->line_config = lc;
-		thread_ctx->id          = tid;
-		thread_ctx->chunk.start = log_view->src + start_offset;
-		thread_ctx->chunk.end   = log_view->src + end_offset;
-		thread_ctx->chunk.size  = end_offset - start_offset;
-		thread_ctx->request_set = rs;
-		thread_ctx->session_map = sm;
+		thread_ctx->log_view          = log_view;
+		thread_ctx->truncate_patterns = tp;
+		thread_ctx->line_config       = lc;
+		thread_ctx->id                = tid;
+		thread_ctx->chunk.start       = log_view->src + start_offset;
+		thread_ctx->chunk.end         = log_view->src + end_offset;
+		thread_ctx->chunk.size        = end_offset - start_offset;
+		thread_ctx->request_set       = rs;
+		thread_ctx->session_map       = sm;
 
 		rc = pthread_create(&work_ctx->thread[tid], NULL, run_thread,
 		                    (void *)thread_ctx);
@@ -1191,7 +1387,7 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 		rid = vertex->rid;
 		request_data = rt->requests[rid];
 		fprintf(out,
-"  r%" PRIu64 " [label=\"%s\\n(%" PRIu64 " hits in, %" PRIu64 " hits out)\"];\n",
+"    r%" PRIuRID " [label=\"%s\\n(%" PRIu64 " hits in, %" PRIu64 " hits out)\"];\n",
 		    rid, request_data, vertex->total_nhits_in, vertex->total_nhits_out);
 	}
 
@@ -1207,7 +1403,7 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 		for (size_t e = 0; e < vertex->nedges; e++) {
 			struct path_graph_edge *edge = &vertex->edges[e];
 			fprintf(out,
-"  r%" PRIu64 " -> r%" PRIu64 " [xlabel=\"%" PRIu64 "\"];\n",
+"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%" PRIu64 "\"];\n",
 			    rid, edge->rid, edge->nhits);
 		}
 	}
@@ -1248,12 +1444,13 @@ validate_session_fields(const char *session_fields)
 int
 main(int argc, char **argv)
 {
-	//char *ignore_patterns = NULL;
 	//char *merge_patterns  = NULL;
 	const char *session_fields = "ip1,useragent";
+	const char *truncate_patterns_path = NULL;
 	long nthreads = -1;
 
-	struct log_view log_view;
+	struct file_view log_view;
+	struct truncate_patterns tp;
 	struct regex_info rx_info;
 	struct line_config lc;
 	struct request_set rs;
@@ -1271,22 +1468,29 @@ main(int argc, char **argv)
 	while (1) {
 		int opt_idx = 0;
 		static struct option long_opts[] = {
-			{"format",          required_argument, 0, 'f' },
-			{"help",            no_argument,       0, 'h' },
-			{"ignore-patterns", required_argument, 0, 'I' },
-			{"merge-patterns",  required_argument, 0, 'M' },
-			{"output",          required_argument, 0, 'o' },
-			{"session",         required_argument, 0, 'S' },
-			{"threads",         required_argument, 0, 'T' },
-			{"version",         no_argument,       0, 'V' },
-			{0,                 0,                 0,  0  }
+			{"concurrency",       required_argument, 0, 'C' },
+			{"format",            required_argument, 0, 'f' },
+			{"help",              no_argument,       0, 'h' },
+			{"ignore-patterns",   required_argument, 0, 'I' },
+			{"truncate-patterns", required_argument, 0, 'T' },
+			{"output",            required_argument, 0, 'o' },
+			{"session",           required_argument, 0, 'S' },
+			{"version",           no_argument,       0, 'V' },
+			{0,                   0,                 0,  0  }
 		};
 
-		int c = getopt_long(argc, argv, "f:hI:M:o:S:T:V", long_opts, &opt_idx);
+		int c = getopt_long(argc, argv, "C:f:hI:T:M:o:S:V", long_opts, &opt_idx);
 		if (c == -1)
 			break;
 
 		switch (c) {
+		case 'C':
+			nthreads = strtol(optarg, NULL, 10);
+			if (nthreads == 0
+		         || nthreads > INT_MAX
+			 || nthreads < INT_MIN)
+				ERRX("invalid thread count: %s", optarg);
+			break;
 		case 'f':
 			if (strcmp(optarg, "dot-graph") == 0)
 				output_format = optarg;
@@ -1295,14 +1499,6 @@ main(int argc, char **argv)
 			break;
 		case 'h':
 			usage();
-			break;
-
-		case 'I':
-			//ignore_patterns = optarg;
-			break;
-
-		case 'M':
-			//merge_patterns = optarg;
 			break;
 		case 'o':
 			output_path = optarg;
@@ -1317,17 +1513,11 @@ main(int argc, char **argv)
 			validate_session_fields(session_fields);
 			break;
 		case 'T':
-			nthreads = strtol(optarg, NULL, 10);
-			if (nthreads == 0
-		         || nthreads > INT_MAX
-			 || nthreads < INT_MIN)
-				ERRX("invalid thread count: %s", optarg);
+			truncate_patterns_path = optarg;
 			break;
-
 		case 'V':
 			printf("%s\n", VERSION);
 			break;
-
 		default:
 			return 1;
 		};
@@ -1340,14 +1530,21 @@ main(int argc, char **argv)
 	if (argc > 1)
 		ERRX("%s", "only one access log allowed");
 
-	init_log_view(&log_view, argv[0]);
+	init_file_view_readonly(&log_view, argv[0]);
+
+	if (truncate_patterns_path != NULL)
+		init_truncate_patterns(&tp, truncate_patterns_path);
+	else
+		memset(&tp, 0, sizeof(tp));
+	//debug_truncate_patterns(&tp);
+
 	init_regex_info(&rx_info);
 	init_line_config(&lc, &log_view, &rx_info, session_fields);
 	init_request_set(&rs);
 	init_session_map(&sm);
 
 	/* Start worker threads */
-	init_work_ctx(&work_ctx, nthreads, &log_view, &lc, &rs, &sm);
+	start_work_ctx(&work_ctx, nthreads, &log_view, &tp, &lc, &rs, &sm);
 
 	/* Wait for worker threads to finish */
 	finish_work_ctx(&work_ctx);
@@ -1386,8 +1583,11 @@ usage(void)
 "    -V, --version    Prints version information\n"
 "\n"
 "OPTIONS:\n"
+"    -C, --concurrency <num_threads>         Number of worker threads\n"
+"                                              default: number of logical CPU cores, or 4 as a fallback\n"
+"\n"
 "    -I, --ignore-patterns <pattern_file>    File containing URL patterns for ignoring HTTP requests\n"
-"    -M, --merge-patterns <pattern_file>     File containing URL patterns for merging HTTP requests\n"
+"    -T, --truncate-patterns <pattern_file>  File containing URL patterns for merging HTTP requests\n"
 "\n"
 "    -o, --output <output_file>              File for output\n"
 "                                              default: \"-\" (standard output)\n"
@@ -1396,15 +1596,23 @@ usage(void)
 "                                              available fields: ip1,ip2,useragent\n"
 "                                              default: ip1,useragent\n"
 "\n"
-"    -T, --threads <num_threads>             Number of worker threads\n"
-"                                              default: number of logical CPU cores, or 4 as a fallback\n"
-"\n"
 "ARGUMENTS:\n"
 "    <ACCESS_LOG>    Access log file containing HTTP request timestamps, IP addresses, methods, URLs and User Agent headers\n",
 	    VERSION);
 	exit(EXIT_FAILURE);
 }
 
+void
+debug_truncate_patterns(struct truncate_patterns *tp)
+{
+	printf("----- BEGIN TRUNCATE PATTERNS -----\n");
+	for (int p = 0; p < tp->npatterns; p++) {
+		printf("[%d]:\n", p);
+		printf("    - pattern: \"%s\"\n", tp->patterns[p]);
+		printf("    - alias: \"%s\"\n", tp->aliases[p]);
+	}
+	printf("----- END TRUNCATE PATTERNS -----\n");
+}
 void
 debug_request_set(struct request_set *rs)
 {
@@ -1470,7 +1678,7 @@ debug_session_map(struct session_map *sm)
 			printf("    nrequests: %zu\n", entry->nrequests);
 			printf("    requests: %p\n", entry->requests);
 			for (size_t i = 0; i < entry->nrequests; i++) {
-				printf("        %" PRIu64 " %" PRIu64 "\n",
+				printf("        %" PRIu64 " %" PRIuRID "\n",
 				       entry->timestamps[i] / 1000, entry->requests[i]);
 			}
 			session_idx++;
