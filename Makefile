@@ -13,13 +13,11 @@ CFLAGS=		-std=c99 \
 		-O2
 
 CFLAGS_RELEASE=	-std=c99 \
-		-pedantic \
 		-Wall \
 		-Wextra \
 		-Werror \
 		-Wno-overlength-strings \
 		-Wno-sign-compare \
-		-pedantic-errors \
 		-D_DEFAULT_SOURCE \
 		-O2
 

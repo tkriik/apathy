@@ -211,15 +211,18 @@ struct request_table {
 typedef uint64_t session_id_t;
 #define PRIuSID PRIu64
 
+struct session_request {
+	request_id_t rid;
+	uint64_t     ts;
+};
+
 /* Session-specific information, stored in a hash table. */
 struct session_map_entry {
-#define SESSION_MAP_ENTRY_MAX_NREQUESTS 16
-	session_id_t sid;       /* Session ID */
-	size_t       nrequests; /* Number of requests in session */
-	/* Request timestamps */
-	uint64_t     timestamps[SESSION_MAP_ENTRY_MAX_NREQUESTS];
-	/* Request fields */
-	request_id_t requests[SESSION_MAP_ENTRY_MAX_NREQUESTS];
+	session_id_t sid;                       /* Session ID */
+	size_t       nrequests;                 /* Number of requests in session */
+#define SESSION_MAP_ENTRY_INIT_CAPREQUESTS 8
+	size_t       caprequests;               /* Request buffer capacity */
+	struct       session_request *requests; /* Request buffer */
 
 	UT_hash_handle hh;
 };
@@ -573,7 +576,6 @@ init_truncate_patterns(struct truncate_patterns *tp, const char *path)
 	tp->npatterns = 0;
 	tp->max_alias_size = 0;
 
-	size_t size = file_view.size;
 	char *src = file_view.src;
 	char *line = src;
 	while (*line != '\0' && tp->npatterns < TRUNCATE_NPATTERNS_MAX) {
@@ -855,7 +857,6 @@ truncate_raw_request(char *trunc_buf, size_t trunc_buf_size,
 
 		size_t start_offset = match->rm_so;
 		end_offset = match->rm_eo;
-		size_t match_size = end_offset - start_offset;
 
 		memcpy(trunc_buf + trunc_size, raw_buf, start_offset);
 		trunc_size += start_offset;
@@ -869,6 +870,7 @@ truncate_raw_request(char *trunc_buf, size_t trunc_buf_size,
 	assert(trunc_size == strlen(trunc_buf));
 	return trunc_size;
 }
+
 /*
  * Stores a request field pointed to by src into the request set rs.
  * Returns a numeric request ID.
@@ -960,7 +962,6 @@ amend_session_map_entry(struct session_map *sm, session_id_t sid, uint64_t ts,
 	assert(sm != NULL);
 
 	int rc;
-	int i;
 	struct session_map_entry *entry = NULL;
 
 	/* TODO: make sid better distributed */
@@ -980,49 +981,42 @@ amend_session_map_entry(struct session_map *sm, session_id_t sid, uint64_t ts,
 		ERR("%s", "pthread_spin_lock");
 
 	HASH_FIND_INT(*handlep, &sid, entry);
-	if (entry != NULL) {
-		if (entry->nrequests == SESSION_MAP_ENTRY_MAX_NREQUESTS)
-			goto finish;
-		else
-			goto amend;
+	if (entry == NULL) {
+		entry = calloc(1, sizeof(*entry));
+		if (entry == NULL)
+			ERR("%s", "calloc");
+		entry->sid = sid;
+		entry->nrequests = 1;
+		entry->caprequests = SESSION_MAP_ENTRY_INIT_CAPREQUESTS;
+		entry->requests = calloc(SESSION_MAP_ENTRY_INIT_CAPREQUESTS,
+		    sizeof(*entry->requests));
+		if (entry->requests == NULL)
+			ERR("%s", "calloc");
+
+		entry->requests[0].rid = rid;
+		entry->requests[0].ts = ts;
+
+		HASH_ADD_INT(*handlep, sid, entry);
+		goto finish;
 	}
 
-	entry = calloc(1, sizeof(*entry));
-	if (entry == NULL)
-		ERR("%s", "calloc");
-	entry->sid = sid;
-	entry->nrequests = 0;
+	if (entry->nrequests == entry->caprequests) {
+		assert(entry->caprequests < (SIZE_MAX / sizeof(*entry->requests) / 2));
 
-	HASH_ADD_INT(*handlep, sid, entry);
-amend:
-	i = entry->nrequests;
-	if (i == 0)
-		goto first;
+		size_t new_caprequests = 2 * entry->caprequests;
+		size_t new_size = new_caprequests * sizeof(*entry->requests);
+		struct session_request *new_requests = realloc(entry->requests,
+		    new_size);
+		if (new_requests == NULL)
+			ERR("%s", "realloc");
 
-	/* Rewind index to sorted timestamp position. */
-	for (; 0 < i && ts < entry->timestamps[i - 1]; i--);
+		entry->caprequests = new_caprequests;
+		entry->requests = new_requests;
+	}
 
-	/*
-	 * Check if request at previous or current index is identical;
-	 * if yes, increment repeat count accordingly.
-	 * */
-	if (entry->requests[i - 1] == rid)
-		goto finish;
-	if (entry->requests[i] == rid)
-		goto finish;
-
-	/*
-	 * Shift the more recent requests up one index
-	 * to make room for the current request.
-	 */
-	int nmove = entry->nrequests - i;
-	memmove(&entry->timestamps[i + 1], &entry->timestamps[i],
-	    nmove * sizeof(entry->timestamps[0]));
-	memmove(&entry->requests[i + 1], &entry->requests[i],
-	    nmove * sizeof(entry->requests[0]));
-first:
-	entry->requests[i] = rid;
-	entry->timestamps[i] = ts;
+	size_t r = entry->nrequests;
+	entry->requests[r].rid = rid;
+	entry->requests[r].ts = ts;
 	entry->nrequests++;
 finish:
 	rc = pthread_spin_unlock(lock);
@@ -1339,6 +1333,14 @@ cmp_path_graph_edge(const void *p1, const void *p2)
 	return e1->nhits < e2->nhits;
 }
 
+int
+cmp_session_request(const void *p1, const void *p2)
+{
+	const struct session_request *r1 = p1;
+	const struct session_request *r2 = p2;
+	return r1->ts > r2->ts;
+}
+
 void
 gen_path_graph(struct path_graph *pg, struct request_set *rs,
                struct session_map *sm)
@@ -1352,12 +1354,12 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 	     bucket_idx++) {
 		struct session_map_entry *entry, *tmp;
 		HASH_ITER(hh, sm->handles[bucket_idx], entry, tmp) {
-			for (size_t request_idx = 0, edge_idx = 1;
-			     request_idx < entry->nrequests;
-			     request_idx++, edge_idx++) {
-				request_id_t rid = entry->requests[request_idx];
-				request_id_t edge_rid = edge_idx < entry->nrequests
-				                      ? entry->requests[edge_idx]
+			qsort(entry->requests, entry->nrequests,
+			    sizeof(*entry->requests), cmp_session_request);
+			for (size_t r = 0, e = 1; r < entry->nrequests; r++, e++) {
+				request_id_t rid = entry->requests[r].rid;
+				request_id_t edge_rid = e < entry->nrequests
+				                      ? entry->requests[e].rid
 						      : REQUEST_ID_INVAL;
 				amend_path_graph_vertex(pg, rid, edge_rid);
 			}
@@ -1679,7 +1681,7 @@ debug_session_map(struct session_map *sm)
 			printf("    requests: %p\n", entry->requests);
 			for (size_t i = 0; i < entry->nrequests; i++) {
 				printf("        %" PRIu64 " %" PRIuRID "\n",
-				       entry->timestamps[i] / 1000, entry->requests[i]);
+				       entry->requests[i].ts / 1000, entry->requests[i].rid);
 			}
 			session_idx++;
 		}
