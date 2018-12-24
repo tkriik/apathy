@@ -185,6 +185,7 @@ typedef size_t request_id_t;
 /* Request field data and incremental ID, stored in a hash table. */
 struct request_set_entry {
 	const char   *data;
+	uint64_t      hash;
 	request_id_t  rid;
 
 	UT_hash_handle hh;
@@ -205,8 +206,9 @@ struct request_set {
 
 /* Mapping from incremental request IDs to request strings. */
 struct request_table {
-	size_t       nrequests; /* Unique request count */
-	const char **requests;  /* Mapping from request IDs to strings */
+	size_t         nrequests; /* Unique request count */
+	const char   **requests;  /* Request ID to string */
+	uint64_t      *hashes;    /* Request ID to hash */
 };
 
 typedef uint64_t session_id_t;
@@ -815,6 +817,13 @@ hash64_update_char(uint64_t hash, char c)
 	return (hash ^ c) * FNV_PRIME64;
 }
 
+/*
+ * Checks if the request data in raw_buf matches against any truncate
+ * patterns, and replaces any matches with their respective aliases.
+ * The resulting modified request data is stored in trunc_buf.
+ *
+ * Returns the size of the (possibly) modified request data.
+ */
 #define REQUEST_NTRUNCS_MAX 8
 size_t
 truncate_raw_request(char *trunc_buf, size_t trunc_buf_size,
@@ -885,7 +894,7 @@ add_request_set_entry(struct request_set *rs, const char *src,
 {
 	assert(src != NULL);
 
-	size_t bucket_idx = hash64_init();
+	size_t hash = hash64_init();
 	struct request_set_entry **handlep;
 	pthread_spinlock_t *bucket_lock;
 	struct request_set_entry *entry;
@@ -905,7 +914,6 @@ add_request_set_entry(struct request_set *rs, const char *src,
 		WARNX("truncating request over %d bytes long", REQUEST_LEN_MAX);
 	req_len = MIN(req_len, REQUEST_LEN_MAX);
 
-
 	char raw_buf[req_len + 1];
 	memcpy(raw_buf, src, req_len);
 	raw_buf[req_len] = '\0';
@@ -914,8 +922,8 @@ add_request_set_entry(struct request_set *rs, const char *src,
 	size_t trunc_size = truncate_raw_request(trunc_buf, sizeof(trunc_buf) - 1,
 	    raw_buf, req_len, tp);
 
-	bucket_idx = hash64_update(bucket_idx, trunc_buf, trunc_size);
-	bucket_idx &= REQUEST_SET_BUCKET_MASK;
+	hash = hash64_update(hash, trunc_buf, trunc_size);
+	size_t bucket_idx = hash & REQUEST_SET_BUCKET_MASK;
 	handlep = &rs->handles[bucket_idx];
 	bucket_lock = &rs->locks[bucket_idx];
 	entry = NULL;
@@ -939,6 +947,7 @@ add_request_set_entry(struct request_set *rs, const char *src,
 	if (pthread_spin_lock(&rs->rid_lock) != 0)
 		ERR("%s", "pthread_spin_lock");
 
+	entry->hash = hash;
 	entry->rid = rs->rid_ctr++;
 	if (pthread_spin_unlock(&rs->rid_lock) != 0)
 		ERR("%s", "pthread_spin_unlock");
@@ -1242,10 +1251,16 @@ gen_request_table(struct request_table *rt, struct request_set *rs)
 	if (rt->requests == NULL)
 		ERR("%s", "calloc");
 
+	rt->hashes = calloc(rt->nrequests, sizeof(*rt->hashes));
+	if (rt->hashes == NULL)
+		ERR("%s", "calloc");
+
 	for (size_t bucket_idx = 0; bucket_idx < REQUEST_SET_NBUCKETS; bucket_idx++) {
 		struct request_set_entry *entry, *tmp;
 		HASH_ITER(hh, rs->handles[bucket_idx], entry, tmp) {
-			rt->requests[entry->rid] = entry->data;
+			request_id_t rid = entry->rid;
+			rt->requests[rid] = entry->data;
+			rt->hashes[rid] = entry->hash;
 		}
 	}
 }
@@ -1433,6 +1448,41 @@ calc_dot_pen_width(double weight)
 	return pen_width;
 }
 
+typedef uint32_t color_t;
+
+#define COLOR_R(c)       (((c) >> 16) & 0xFF)
+#define COLOR_G(c)       (((c) >>  8) & 0xFF)
+#define COLOR_B(c)       (((c) >>  0) & 0xFF)
+
+color_t
+mkcolor(uint8_t r, uint8_t g, uint8_t b)
+{
+	color_t c = (r << 16) | (g << 8) | b;
+	assert(c < (1 << 24));
+	return c;
+}
+
+color_t
+hash_to_color(uint64_t hash)
+{
+	uint8_t r = 0x80 | (0xFF & (hash >> 16));
+	uint8_t g = 0x80 | (0xFF & (hash >>  8));
+	uint8_t b = 0x80 | (0xFF & (hash >>  0));
+	return mkcolor(r, g, b);
+}
+
+color_t
+node_to_edge_color(color_t c)
+{
+	double mult = 0.5;
+	uint8_t r = MAX(COLOR_R(c) * mult, 0x00);
+	uint8_t g = MAX(COLOR_G(c) * mult, 0x00);
+	uint8_t b = MAX(COLOR_B(c) * mult, 0x00);
+	return mkcolor(r, g, b);
+}
+
+#define COLOR_FMT "\"#%06" PRIx32 "\""
+
 void
 output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 {
@@ -1443,6 +1493,7 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 	struct path_graph_vertex *vertex;
 	request_id_t rid;
 	const char *request_data;
+	uint64_t request_hash;
 
 	fprintf(out,
 "digraph apathy_graph {\n"
@@ -1458,17 +1509,24 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 
 		rid = vertex->rid;
 		request_data = rt->requests[rid];
+		request_hash = rt->hashes[rid];
+
 		double pct_in = 100 * ((double)vertex->total_nhits_in / (double)pg->total_nhits);
 		double pct_out = 100 * ((double)vertex->total_nhits_out / (double)pg->total_nhits);
 		double weight = calc_dot_weight(pg->total_nhits, vertex->total_nhits_out);
 		int font_size = calc_dot_font_size(weight);
 		double pen_width = calc_dot_pen_width(weight);
+		color_t node_color = hash_to_color(request_hash);
+
 		fprintf(out,
 "    r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "))\", "
                    "fontsize=%d, "
+		   "style=filled, "
+		   "fillcolor=" COLOR_FMT ", "
 		   "penwidth=%lf];\n",
 		    rid, request_data, pct_in, vertex->total_nhits_in,
-		    pct_out, vertex->total_nhits_out, font_size, pen_width);
+		    pct_out, vertex->total_nhits_out, font_size,
+		    node_color, pen_width);
 	}
 
 	fprintf(out, "\n");
@@ -1480,6 +1538,7 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 			continue;
 
 		rid = vertex->rid;
+		request_hash = rt->hashes[rid];
 		for (size_t e = 0; e < vertex->nedges; e++) {
 			struct path_graph_edge *edge = &vertex->edges[e];
 			double pct = 100 * ((double)edge->nhits / pg->total_nhits);
@@ -1487,9 +1546,18 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 			    edge->nhits);
 			int font_size = calc_dot_font_size(weight);
 			double pen_width = calc_dot_pen_width(weight);
+
+			color_t edge_color = hash_to_color(request_hash);
+			edge_color = node_to_edge_color(edge_color);
+
 			fprintf(out,
-"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\", fontsize=%d, penwidth=%lf];\n",
-			    rid, edge->rid, pct, edge->nhits, font_size, pen_width);
+"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\", "
+                                    "fontsize=%d, "
+				    "color=" COLOR_FMT ", "
+				    "fontcolor=" COLOR_FMT ", "
+				    "penwidth=%lf];\n",
+			    rid, edge->rid, pct, edge->nhits, font_size,
+			    edge_color, edge_color, pen_width);
 		}
 	}
 

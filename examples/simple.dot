@@ -2,13 +2,13 @@ digraph apathy_graph {
     nodesep=1.0;
     ordering=out;
 
-    r0 [label="GET http://my-api/login\n(in 33.33% (3), out 33.33% (3))", fontsize=22, penwidth=3.886751];
-    r1 [label="GET http://my-api/data\n(in 33.33% (3), out 22.22% (2))", fontsize=20, penwidth=3.357023];
-    r2 [label="POST http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, penwidth=1.000000];
-    r3 [label="DELETE http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, penwidth=1.000000];
-    r4 [label="GET http://my-api/health\n(in 11.11% (1), out 0.00% (0))", fontsize=14, penwidth=1.000000];
+    r0 [label="GET http://my-api/login\n(in 33.33% (3), out 33.33% (3))", fontsize=22, style=filled, fillcolor="#e2aaae", penwidth=3.886751];
+    r1 [label="GET http://my-api/data\n(in 33.33% (3), out 22.22% (2))", fontsize=20, style=filled, fillcolor="#a6ffb9", penwidth=3.357023];
+    r2 [label="POST http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#c6e5e9", penwidth=1.000000];
+    r3 [label="DELETE http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#9180b2", penwidth=1.000000];
+    r4 [label="GET http://my-api/health\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#d3c5eb", penwidth=1.000000];
 
-    r0 -> r1 [xlabel="33.33% (3)", fontsize=22, penwidth=3.886751];
-    r1 -> r3 [xlabel="11.11% (1)", fontsize=18, penwidth=2.666667];
-    r1 -> r2 [xlabel="11.11% (1)", fontsize=18, penwidth=2.666667];
+    r0 -> r1 [xlabel="33.33% (3)", fontsize=22, color="#715557", fontcolor="#715557", penwidth=3.886751];
+    r1 -> r3 [xlabel="11.11% (1)", fontsize=18, color="#537f5c", fontcolor="#537f5c", penwidth=2.666667];
+    r1 -> r2 [xlabel="11.11% (1)", fontsize=18, color="#537f5c", fontcolor="#537f5c", penwidth=2.666667];
 }
