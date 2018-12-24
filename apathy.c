@@ -88,6 +88,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <regex.h>
 #include <stdint.h>
@@ -264,6 +265,9 @@ struct path_graph {
 	size_t nvertices;                   /* Number of vertices */
 	size_t capvertices;                 /* Vertex buffer capacity */
 	struct path_graph_vertex *vertices; /* Vertex buffer */
+
+	/* Statistics */
+	uint64_t total_nhits;               /* Total number of hits */
 };
 
 /* Thread-specific context. */
@@ -1147,6 +1151,7 @@ init_path_graph(struct path_graph *pg, struct request_table *rt)
 	assert(rt != NULL);
 
 	pg->total_nedges = 0;
+	pg->total_nhits = 0;
 	pg->nvertices = 0;
 	pg->capvertices = rt->nrequests;
 	pg->vertices = calloc(pg->capvertices, sizeof(*pg->vertices));
@@ -1278,12 +1283,14 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t ed
 		}
 
 		vertex->total_nhits_in++;
+		pg->total_nhits++;
 		pg->nvertices++;
 
 		return;
 	}
 
 	vertex->total_nhits_in++;
+	pg->total_nhits++;
 
 	if (edge_rid == REQUEST_ID_INVAL)
 		return;
@@ -1322,23 +1329,42 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t ed
 }
 
 int
-cmp_path_graph_edge(const void *p1, const void *p2)
-{
-	assert(p1 != NULL);
-	assert(p2 != NULL);
-
-	const struct path_graph_edge *e1 = p1;
-	const struct path_graph_edge *e2 = p2;
-
-	return e1->nhits < e2->nhits;
-}
-
-int
 cmp_session_request(const void *p1, const void *p2)
 {
 	const struct session_request *r1 = p1;
 	const struct session_request *r2 = p2;
-	return r1->ts > r2->ts;
+
+	if (r1->ts == r2->ts)
+		return 0;
+	else
+		return r1->ts > r2->ts;
+}
+
+int
+cmp_path_graph_vertex_by_hits(const void *p1, const void *p2)
+{
+	const struct path_graph_vertex *v1 = p1;
+	const struct path_graph_vertex *v2 = p2;
+
+	uint64_t score1 = v1->total_nhits_in + v1->total_nhits_out;
+	uint64_t score2 = v2->total_nhits_in + v2->total_nhits_out;
+
+	if (score1 == score2)
+		return 0;
+	else
+		return score1 < score2;
+}
+
+int
+cmp_path_graph_edge_by_hits(const void *p1, const void *p2)
+{
+	const struct path_graph_edge *e1 = p1;
+	const struct path_graph_edge *e2 = p2;
+
+	if (e1->nhits == e2->nhits)
+		return 0;
+	else
+		return e1->nhits < e2->nhits;
 }
 
 void
@@ -1365,6 +1391,46 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 			}
 		}
 	}
+
+	/* Sort vertices and edges by hit counts */
+	qsort(pg->vertices, pg->nvertices, sizeof(*pg->vertices),
+	    cmp_path_graph_vertex_by_hits);
+	for (size_t v = 0; v < pg->nvertices; v++) {
+		struct path_graph_vertex *vertex = &pg->vertices[v];
+		qsort(vertex->edges, vertex->nedges, sizeof(*vertex->edges),
+		    cmp_path_graph_edge_by_hits);
+	}
+}
+
+double
+calc_dot_weight(uint64_t total_nhits, uint64_t nhits)
+{
+	assert(nhits <= total_nhits);
+	double weight = sqrt((double)nhits / (double)total_nhits);
+	assert(0.0 <= weight && weight <= 1.0);
+	return weight;
+}
+
+int
+calc_dot_font_size(double weight)
+{
+#define DOT_WEAK_FONT_SIZE 14
+#define DOT_STRONG_FONT_SIZE (2 * DOT_WEAK_FONT_SIZE)
+#define DOT_FONT_SCALE (DOT_STRONG_FONT_SIZE - DOT_WEAK_FONT_SIZE)
+	int font_size = DOT_WEAK_FONT_SIZE + (int)(weight * DOT_FONT_SCALE);
+	assert(DOT_WEAK_FONT_SIZE <= font_size && font_size <= DOT_STRONG_FONT_SIZE);
+	return font_size;
+}
+
+double
+calc_dot_pen_width(double weight)
+{
+#define DOT_WEAK_PEN_WIDTH 1.0
+#define DOT_STRONG_PEN_WIDTH 6.0
+#define DOT_PEN_WIDTH_SCALE (DOT_STRONG_PEN_WIDTH - DOT_WEAK_PEN_WIDTH)
+	double pen_width = DOT_WEAK_PEN_WIDTH + weight * DOT_PEN_WIDTH_SCALE;
+	assert(DOT_WEAK_PEN_WIDTH <= pen_width && pen_width <= DOT_STRONG_PEN_WIDTH);
+	return pen_width;
 }
 
 void
@@ -1378,7 +1444,11 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 	request_id_t rid;
 	const char *request_data;
 
-	fprintf(out, "digraph apathy_graph {\n");
+	fprintf(out,
+"digraph apathy_graph {\n"
+"    nodesep=1.0;\n"
+"    ordering=out;\n"
+"\n");
 
 	/* Declare nodes with labels */
 	for (size_t v = 0; v < pg->capvertices; v++) {
@@ -1388,9 +1458,17 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 
 		rid = vertex->rid;
 		request_data = rt->requests[rid];
+		double pct_in = 100 * ((double)vertex->total_nhits_in / (double)pg->total_nhits);
+		double pct_out = 100 * ((double)vertex->total_nhits_out / (double)pg->total_nhits);
+		double weight = calc_dot_weight(pg->total_nhits, vertex->total_nhits_out);
+		int font_size = calc_dot_font_size(weight);
+		double pen_width = calc_dot_pen_width(weight);
 		fprintf(out,
-"    r%" PRIuRID " [label=\"%s\\n(%" PRIu64 " hits in, %" PRIu64 " hits out)\"];\n",
-		    rid, request_data, vertex->total_nhits_in, vertex->total_nhits_out);
+"    r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "))\", "
+                   "fontsize=%d, "
+		   "penwidth=%lf];\n",
+		    rid, request_data, pct_in, vertex->total_nhits_in,
+		    pct_out, vertex->total_nhits_out, font_size, pen_width);
 	}
 
 	fprintf(out, "\n");
@@ -1404,9 +1482,14 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 		rid = vertex->rid;
 		for (size_t e = 0; e < vertex->nedges; e++) {
 			struct path_graph_edge *edge = &vertex->edges[e];
+			double pct = 100 * ((double)edge->nhits / pg->total_nhits);
+			double weight = calc_dot_weight(pg->total_nhits,
+			    edge->nhits);
+			int font_size = calc_dot_font_size(weight);
+			double pen_width = calc_dot_pen_width(weight);
 			fprintf(out,
-"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%" PRIu64 "\"];\n",
-			    rid, edge->rid, edge->nhits);
+"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\", fontsize=%d, penwidth=%lf];\n",
+			    rid, edge->rid, pct, edge->nhits, font_size, pen_width);
 		}
 	}
 

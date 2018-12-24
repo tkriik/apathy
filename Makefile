@@ -21,7 +21,7 @@ CFLAGS_RELEASE=	-std=c99 \
 		-D_DEFAULT_SOURCE \
 		-O2
 
-LDFLAGS=	-lpthread
+LDFLAGS=	-lm -lpthread
 
 SRC=		apathy.c
 BIN=		apathy

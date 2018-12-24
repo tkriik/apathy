@@ -1,14 +1,16 @@
 digraph apathy_graph {
-    r0 [label="GET http://my-api/login\n(3 hits in, 3 hits out)"];
-    r1 [label="GET http://my-api/data\n(3 hits in, 3 hits out)"];
-    r2 [label="POST http://my-api/data\n(1 hits in, 0 hits out)"];
-    r3 [label="DELETE http://my-api/data\n(1 hits in, 0 hits out)"];
-    r4 [label="GET http://my-api/health\n(1 hits in, 0 hits out)"];
-    r5 [label="GET http://my-api/token/$UUID/data/$UUID\n(2 hits in, 1 hits out)"];
+    nodesep=1.0;
+    ordering=out;
+    r0 [label="GET http://my-api/login\n(3 hits in, 3 hits out)", fontsize=17, penwidth=1.818182];
+    r1 [label="GET http://my-api/data\n(3 hits in, 3 hits out)", fontsize=17, penwidth=1.818182];
+    r2 [label="POST http://my-api/data\n(1 hits in, 0 hits out)", fontsize=14, penwidth=1.136364];
+    r3 [label="DELETE http://my-api/data\n(1 hits in, 0 hits out)", fontsize=14, penwidth=1.136364];
+    r4 [label="GET http://my-api/health\n(1 hits in, 0 hits out)", fontsize=14, penwidth=1.136364];
+    r5 [label="GET http://my-api/token/$UUID/data/$UUID\n(2 hits in, 1 hits out)", fontsize=15, penwidth=1.409091];
 
-    r0 -> r1 [xlabel="3"];
-    r1 -> r3 [xlabel="1"];
-    r1 -> r2 [xlabel="1"];
-    r1 -> r5 [xlabel="1"];
-    r5 -> r5 [xlabel="1"];
+    r0 -> r1 [xlabel="3", fontsize=17, penwidth=1.818182];
+    r1 -> r3 [xlabel="1", fontsize=15, penwidth=1.272727];
+    r1 -> r2 [xlabel="1", fontsize=15, penwidth=1.272727];
+    r1 -> r5 [xlabel="1", fontsize=15, penwidth=1.272727];
+    r5 -> r5 [xlabel="1", fontsize=15, penwidth=1.272727];
 }
