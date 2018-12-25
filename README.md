@@ -82,15 +82,28 @@ From the image we can observe at least the following facts:
   * `GET http://my-api/health` has been called 3 times, consisting of 2
     repeats, so it's probably from a monitoring service.
 
-### What is a session?
+### How?
 
-A session is meant to identify a single user or system during the
-lifetime of a log file, consisting of the source IP address and user agent
-string by default.
+The program constructs a *session ID* from each HTTP log entry,
+using the user agent and first IPv4 address by default. It uses
+this information to construct a call path for each session, after
+which we can generate a call graph like above.
+
+
+INSTALL
+-------
+
+Tested on Linux only at the moment.
+
+Recent `clang` or `gcc`, and `pthreads` required.
+
+    $ make clean all
 
 
 USAGE
 -----
+
+See `./apathy --help` for command-line reference.
 
 The program expects that any log files fed to it contain
 at least the following fields:
@@ -114,5 +127,7 @@ TODO
 
   * ignore patterns
   * IPv6 source and destination addresses
+  * IP without port sessions
   * tests
   * non-surrounded request fields
+  * query parameter session IDs
