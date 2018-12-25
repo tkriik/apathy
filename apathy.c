@@ -1192,14 +1192,12 @@ start_work_ctx(struct work_ctx *work_ctx, int nthreads, struct file_view *log_vi
 		nthreads = 1;
 	else if (nthreads == -1) {
 		nthreads = 1;
-		/* TODO: uncomment this when multithreading is deterministic
-		 * nthreads = sysconf(_SC_NPROCESSORS_CONF);
-		 * if (nthreads == -1) {
-		 * 	warn("failed to read CPU core count, using %d threads by default",
-		 * 	     NTHREADS_DEFAULT);
-		 * 	nthreads = NTHREADS_DEFAULT;
-		 * }
-		 */
+		nthreads = sysconf(_SC_NPROCESSORS_CONF);
+		if (nthreads == -1) {
+			warn("failed to read CPU core count, using %d threads by default",
+			     NTHREADS_DEFAULT);
+			nthreads = NTHREADS_DEFAULT;
+		}
 	}
 
 	if (nthreads > NTHREADS_MAX)
