@@ -1554,13 +1554,13 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 		color_t node_color = hash_to_node_color(request_hash);
 
 		fprintf(out,
-"        r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "), min_depth = %" PRIu64 ")\", "
+"        r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "))\", "
                        "fontsize=%d, "
 		       "style=filled, "
 		       "fillcolor=" COLOR_FMT ", "
 		       "penwidth=%lf];\n",
 		    rid, request_data, pct_in, vertex->total_nhits_in,
-		    pct_out, vertex->total_nhits_out, vertex->min_depth,
+		    pct_out, vertex->total_nhits_out,
 		    font_size, node_color, pen_width);
 
 		v++;

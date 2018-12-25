@@ -43,19 +43,19 @@ Running the command below...
     
         subgraph s0 {
             rank = same;
-            r0 [label="GET http://my-api/login\n(in 33.33% (4), out 25.00% (3), min_depth = 1)", fontsize=28, style=filled, fillcolor="#e2aaae", penwidth=4.000000];
-            r1 [label="GET http://my-api/health\n(in 25.00% (3), out 16.67% (2), min_depth = 1)", fontsize=25, style=filled, fillcolor="#d3c5eb", penwidth=3.632993];
+            r0 [label="GET http://my-api/login\n(in 33.33% (4), out 75.00% (3))", fontsize=30, style=filled, fillcolor="#e2aaae", penwidth=4.309401];
+            r1 [label="GET http://my-api/health\n(in 25.00% (3), out 66.67% (2))", fontsize=28, style=filled, fillcolor="#d3c5eb", penwidth=4.000000];
         }
     
         subgraph s1 {
             rank = same;
-            r2 [label="GET http://my-api/data\n(in 25.00% (3), out 16.67% (2), min_depth = 2)", fontsize=25, style=filled, fillcolor="#a6ffb9", penwidth=3.632993];
+            r2 [label="GET http://my-api/data\n(in 25.00% (3), out 66.67% (2))", fontsize=28, style=filled, fillcolor="#a6ffb9", penwidth=4.000000];
         }
     
         subgraph s2 {
             rank = same;
-            r3 [label="POST http://my-api/data\n(in 8.33% (1), out 8.33% (1), min_depth = 3)", fontsize=22, style=filled, fillcolor="#c6e5e9", penwidth=3.154701];
-            r4 [label="DELETE http://my-api/data\n(in 8.33% (1), out 0.00% (0), min_depth = 3)", fontsize=14, style=filled, fillcolor="#9180b2", penwidth=2.000000];
+            r3 [label="POST http://my-api/data\n(in 8.33% (1), out 100.00% (1))", fontsize=22, style=filled, fillcolor="#c6e5e9", penwidth=3.154701];
+            r4 [label="DELETE http://my-api/data\n(in 8.33% (1), out 0.00% (0))", fontsize=22, style=filled, fillcolor="#9180b2", penwidth=3.154701];
         }
     
         r0 -> r2 [xlabel="25.00% (3)", fontsize=28, style="solid", color="#b4888b", fontcolor="#876668", penwidth=4.000000];
