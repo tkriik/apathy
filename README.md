@@ -125,9 +125,10 @@ in order to identify meaningul session information:
 TODO
 ----
 
-  * ignore patterns
-  * IPv6 source and destination addresses
   * IP without port sessions
-  * tests
+  * custom session fields
+  * duration info
   * non-surrounded request fields
   * query parameter session IDs
+  * IPv6 source and destination addresses
+  * ignore patterns
