@@ -18,10 +18,13 @@ how other people or systems are using a specific web service.
 For example, we have the following dummy access log at `examples/simple.log`:
 
     2018-12-12T12:00:01.000Z 127.0.0.10:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 1"
+    2018-12-12T12:00:01.500Z 127.0.0.90:5000 127.0.0.1:80 "GET http://my-api/health" "httpkit"
     2018-12-12T12:00:02.000Z 127.0.0.20:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 2"
     2018-12-12T12:00:03.000Z 127.0.0.10:5000 127.0.0.1:80 "GET http://my-api/data" "Mozilla/5.0 USERAGENT 1"
     2018-12-12T12:00:04.000Z 127.0.0.20:5000 127.0.0.1:80 "GET http://my-api/data" "Mozilla/5.0 USERAGENT 2"
     2018-12-12T12:00:05.000Z 127.0.0.10:5000 127.0.0.1:80 "POST http://my-api/data" "Mozilla/5.0 USERAGENT 1"
+    2018-12-12T12:00:05.250Z 127.0.0.10:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 1"
+    2018-12-12T12:00:05.500Z 127.0.0.90:5000 127.0.0.1:80 "GET http://my-api/health" "httpkit"
     2018-12-12T12:00:06.000Z 127.0.0.20:5000 127.0.0.1:80 "DELETE http://my-api/data" "Mozilla/5.0 USERAGENT 2"
     2018-12-12T12:00:07.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/login" "Mozilla/5.0 USERAGENT 3"
     2018-12-12T12:00:08.000Z 127.0.0.30:5000 127.0.0.1:80 "GET http://my-api/data" "Mozilla/5.0 USERAGENT 3"
@@ -29,41 +32,55 @@ For example, we have the following dummy access log at `examples/simple.log`:
 
 Running the command below...
 
-    $ apathy -o examples/simple.dot examples/simple.log
+    $ ./apathy -o examples/simple.dot examples/simple.log
 
 ...would produce the following `dot` -formatted file in `examples/simple.dot`:
 
     digraph apathy_graph {
         nodesep=1.0;
-        ordering=out;
+        rankdir=LR;
+        ranksep=1.0;
     
-        r0 [label="GET http://my-api/login\n(in 33.33% (3), out 33.33% (3))", fontsize=22, style=filled, fillcolor="#e2aaae", penwidth=3.886751];
-        r1 [label="GET http://my-api/data\n(in 33.33% (3), out 22.22% (2))", fontsize=20, style=filled, fillcolor="#a6ffb9", penwidth=3.357023];
-        r2 [label="POST http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#c6e5e9", penwidth=1.000000];
-        r3 [label="DELETE http://my-api/data\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#9180b2", penwidth=1.000000];
-        r4 [label="GET http://my-api/health\n(in 11.11% (1), out 0.00% (0))", fontsize=14, style=filled, fillcolor="#d3c5eb", penwidth=1.000000];
+        subgraph s0 {
+            rank = same;
+            r0 [label="GET http://my-api/login\n(in 33.33% (4), out 25.00% (3), min_depth = 1)", fontsize=28, style=filled, fillcolor="#e2aaae", penwidth=4.000000];
+            r1 [label="GET http://my-api/health\n(in 25.00% (3), out 16.67% (2), min_depth = 1)", fontsize=25, style=filled, fillcolor="#d3c5eb", penwidth=3.632993];
+        }
     
-        r0 -> r1 [xlabel="33.33% (3)", fontsize=22, color="#715557", fontcolor="#715557", penwidth=3.886751];
-        r1 -> r3 [xlabel="11.11% (1)", fontsize=18, color="#537f5c", fontcolor="#537f5c", penwidth=2.666667];
-        r1 -> r2 [xlabel="11.11% (1)", fontsize=18, color="#537f5c", fontcolor="#537f5c", penwidth=2.666667];
+        subgraph s1 {
+            rank = same;
+            r2 [label="GET http://my-api/data\n(in 25.00% (3), out 16.67% (2), min_depth = 2)", fontsize=25, style=filled, fillcolor="#a6ffb9", penwidth=3.632993];
+        }
+    
+        subgraph s2 {
+            rank = same;
+            r3 [label="POST http://my-api/data\n(in 8.33% (1), out 8.33% (1), min_depth = 3)", fontsize=22, style=filled, fillcolor="#c6e5e9", penwidth=3.154701];
+            r4 [label="DELETE http://my-api/data\n(in 8.33% (1), out 0.00% (0), min_depth = 3)", fontsize=14, style=filled, fillcolor="#9180b2", penwidth=2.000000];
+        }
+    
+        r0 -> r2 [xlabel="25.00% (3)", fontsize=28, style="solid", color="#b4888b", fontcolor="#876668", penwidth=4.000000];
+        r1 -> r1 [xlabel="16.67% (2)", fontsize=25, style="dotted", color="#a89dbc", fontcolor="#7e768d", penwidth=3.632993];
+        r2 -> r4 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
+        r2 -> r3 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
+        r3 -> r0 [xlabel="8.33% (1)", fontsize=22, style="dashed", color="#9eb7ba", fontcolor="#76898b", penwidth=3.154701];
     }
 
-Now we can, for example, use the `graphviz` tool to transform it into a PNG image:
+Now we can, for example, use the `dot` tool from `graphviz`
+to transform it into a PNG image:
 
-    $ sfdp -x -Goverlap=scale -Tpng examples/simple.dot -o examples/simple.png
+    $ dot -Tpng examples/simple.dot -o examples/simple.png
 
 ![alt text](examples/simple.png)
 
-From the image we can observe the following facts:
+From the image we can observe at least the following facts:
 
-  * `GET http://my-api/login` was called 3 times, and each session
-    made another 3 calls after that.
-  * `GET http://my-api/data` was called 3 times, but only 2 sessions
-    made any other requests after that.
-  * `POST http://my-api/data` and `DELETE http://my-api/data` were both called
-    only once, and no requests were made after that during any sessions.
-  * `GET http://my-api/health` has been called once without a follow-up,
-    so it's probably from a monitoring service.
+  * The most common call path is from `GET http://my-api/login` to
+    `GET http://my-api/data`, as that edge was taken 3 times.
+  * Less common edges are from `GET http://my-api/data` to 
+    `POST http://my-api/data` and `DELETE http://my-api/data`,
+    and from `POST http://my-api/data` back to `GET http://my-api/login`.
+  * `GET http://my-api/health` has been called 3 times, consisting of 2
+    repeats, so it's probably from a monitoring service.
 
 ### What is a session?
 

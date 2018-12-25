@@ -251,6 +251,7 @@ struct path_graph_vertex {
 	struct       path_graph_edge *edges; /* Outward edges */
 	uint64_t     total_nhits_in;         /* Total number of hits to this vertex */
 	uint64_t     total_nhits_out;        /* Total number of hits from this vertex */
+	uint64_t     min_depth;
 };
 
 static const struct path_graph_vertex NULL_VERTEX = {
@@ -1273,7 +1274,8 @@ is_null_vertex(struct path_graph_vertex *v)
 }
 
 void
-amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t edge_rid)
+amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
+                        request_id_t rid, request_id_t edge_rid)
 {
 	assert(pg != NULL);
 	assert(rid != REQUEST_ID_INVAL);
@@ -1298,6 +1300,7 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t ed
 		}
 
 		vertex->total_nhits_in++;
+		vertex->min_depth = depth;
 		pg->total_nhits++;
 		pg->nvertices++;
 
@@ -1305,6 +1308,7 @@ amend_path_graph_vertex(struct path_graph *pg, request_id_t rid, request_id_t ed
 	}
 
 	vertex->total_nhits_in++;
+	vertex->min_depth = MIN(depth, vertex->min_depth);
 	pg->total_nhits++;
 
 	if (edge_rid == REQUEST_ID_INVAL)
@@ -1361,6 +1365,11 @@ cmp_path_graph_vertex_by_hits(const void *p1, const void *p2)
 	const struct path_graph_vertex *v1 = p1;
 	const struct path_graph_vertex *v2 = p2;
 
+	if (v1->min_depth < v2->min_depth)
+		return -1;
+	else if (v1->min_depth > v2->min_depth)
+		return 1;
+
 	uint64_t score1 = v1->total_nhits_in + v1->total_nhits_out;
 	uint64_t score2 = v2->total_nhits_in + v2->total_nhits_out;
 
@@ -1397,12 +1406,14 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 		HASH_ITER(hh, sm->handles[bucket_idx], entry, tmp) {
 			qsort(entry->requests, entry->nrequests,
 			    sizeof(*entry->requests), cmp_session_request);
+			uint64_t depth = 1;
 			for (size_t r = 0, e = 1; r < entry->nrequests; r++, e++) {
 				request_id_t rid = entry->requests[r].rid;
 				request_id_t edge_rid = e < entry->nrequests
 				                      ? entry->requests[e].rid
 						      : REQUEST_ID_INVAL;
-				amend_path_graph_vertex(pg, rid, edge_rid);
+				amend_path_graph_vertex(pg, depth, rid, edge_rid);
+				depth = rid == edge_rid ? depth : depth + 1;
 			}
 		}
 	}
@@ -1430,7 +1441,7 @@ int
 calc_dot_font_size(double weight)
 {
 #define DOT_WEAK_FONT_SIZE 14
-#define DOT_STRONG_FONT_SIZE (2 * DOT_WEAK_FONT_SIZE)
+#define DOT_STRONG_FONT_SIZE (3 * DOT_WEAK_FONT_SIZE)
 #define DOT_FONT_SCALE (DOT_STRONG_FONT_SIZE - DOT_WEAK_FONT_SIZE)
 	int font_size = DOT_WEAK_FONT_SIZE + (int)(weight * DOT_FONT_SCALE);
 	assert(DOT_WEAK_FONT_SIZE <= font_size && font_size <= DOT_STRONG_FONT_SIZE);
@@ -1440,7 +1451,7 @@ calc_dot_font_size(double weight)
 double
 calc_dot_pen_width(double weight)
 {
-#define DOT_WEAK_PEN_WIDTH 1.0
+#define DOT_WEAK_PEN_WIDTH 2.0
 #define DOT_STRONG_PEN_WIDTH 6.0
 #define DOT_PEN_WIDTH_SCALE (DOT_STRONG_PEN_WIDTH - DOT_WEAK_PEN_WIDTH)
 	double pen_width = DOT_WEAK_PEN_WIDTH + weight * DOT_PEN_WIDTH_SCALE;
@@ -1463,7 +1474,7 @@ mkcolor(uint8_t r, uint8_t g, uint8_t b)
 }
 
 color_t
-hash_to_color(uint64_t hash)
+hash_to_node_color(uint64_t hash)
 {
 	uint8_t r = 0x80 | (0xFF & (hash >> 16));
 	uint8_t g = 0x80 | (0xFF & (hash >>  8));
@@ -1472,9 +1483,8 @@ hash_to_color(uint64_t hash)
 }
 
 color_t
-node_to_edge_color(color_t c)
+node_to_edge_color(color_t c, double mult)
 {
-	double mult = 0.5;
 	uint8_t r = MAX(COLOR_R(c) * mult, 0x00);
 	uint8_t g = MAX(COLOR_G(c) * mult, 0x00);
 	uint8_t b = MAX(COLOR_B(c) * mult, 0x00);
@@ -1498,38 +1508,77 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 	fprintf(out,
 "digraph apathy_graph {\n"
 "    nodesep=1.0;\n"
-"    ordering=out;\n"
+"    rankdir=LR;\n"
+"    ranksep=1.0;\n"
 "\n");
 
-	/* Declare nodes with labels */
-	for (size_t v = 0; v < pg->capvertices; v++) {
+
+	uint64_t prev_depth = 0, cur_depth = 0;
+	int first = 1;
+	int open_subgraph = 1;
+
+	/* Declare nodes with labels, and rank by minimum depth */
+	size_t v = 0;
+	uint64_t subgraph_id = 0;
+	while (v < pg->capvertices) {
 		vertex = &pg->vertices[v];
 		if (is_null_vertex(vertex))
 			continue;
+
+		if (open_subgraph) {
+			fprintf(out,
+"    subgraph s%" PRIu64 " {\n"
+"        rank = same;\n",
+			    subgraph_id);
+			open_subgraph = 0;
+			subgraph_id++;
+		}
+
+		if (first) {
+			cur_depth = vertex->min_depth;
+			prev_depth = cur_depth;
+			first = 0;
+		} else {
+			prev_depth = cur_depth;
+			cur_depth = vertex->min_depth;
+			if (prev_depth != cur_depth)
+				goto close_subgraph;
+		}
 
 		rid = vertex->rid;
 		request_data = rt->requests[rid];
 		request_hash = rt->hashes[rid];
 
 		double pct_in = 100 * ((double)vertex->total_nhits_in / (double)pg->total_nhits);
-		double pct_out = 100 * ((double)vertex->total_nhits_out / (double)pg->total_nhits);
-		double weight = calc_dot_weight(pg->total_nhits, vertex->total_nhits_out);
+		double pct_out = 100 * ((double)vertex->total_nhits_out / (double)vertex->total_nhits_in);
+		double weight = calc_dot_weight(pg->total_nhits, vertex->total_nhits_in);
 		int font_size = calc_dot_font_size(weight);
 		double pen_width = calc_dot_pen_width(weight);
-		color_t node_color = hash_to_color(request_hash);
+		color_t node_color = hash_to_node_color(request_hash);
 
 		fprintf(out,
-"    r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "))\", "
-                   "fontsize=%d, "
-		   "style=filled, "
-		   "fillcolor=" COLOR_FMT ", "
-		   "penwidth=%lf];\n",
+"        r%" PRIuRID " [label=\"%s\\n(in %.2lf%% (%" PRIu64 "), out %.2lf%% (%" PRIu64 "), min_depth = %" PRIu64 ")\", "
+                       "fontsize=%d, "
+		       "style=filled, "
+		       "fillcolor=" COLOR_FMT ", "
+		       "penwidth=%lf];\n",
 		    rid, request_data, pct_in, vertex->total_nhits_in,
-		    pct_out, vertex->total_nhits_out, font_size,
-		    node_color, pen_width);
+		    pct_out, vertex->total_nhits_out, vertex->min_depth,
+		    font_size, node_color, pen_width);
+
+		v++;
+close_subgraph:
+		if (prev_depth != cur_depth) {
+			fprintf(out,
+"    }\n\n");
+			open_subgraph = 1;
+		}
 	}
 
-	fprintf(out, "\n");
+	if (!open_subgraph) {
+			fprintf(out,
+"    }\n\n");
+	}
 
 	/* Link nodes */
 	for (size_t v = 0; v < pg->capvertices; v++) {
@@ -1541,23 +1590,41 @@ output_dot_graph(FILE *out, struct path_graph *pg, struct request_table *rt)
 		request_hash = rt->hashes[rid];
 		for (size_t e = 0; e < vertex->nedges; e++) {
 			struct path_graph_edge *edge = &vertex->edges[e];
+
 			double pct = 100 * ((double)edge->nhits / pg->total_nhits);
 			double weight = calc_dot_weight(pg->total_nhits,
 			    edge->nhits);
 			int font_size = calc_dot_font_size(weight);
 			double pen_width = calc_dot_pen_width(weight);
 
-			color_t edge_color = hash_to_color(request_hash);
-			edge_color = node_to_edge_color(edge_color);
+			request_id_t edge_rid = edge->rid;
+			struct path_graph_vertex *edge_vertex = &pg->vertices[edge_rid];
+			assert(!is_null_vertex(edge_vertex));
+			const char *style;
+			if (rid == edge_rid)
+				style = "dotted";
+			else if (vertex->min_depth <= edge_vertex->min_depth)
+				style = "solid";
+			else
+				style = "dashed";
+
+			color_t node_color = hash_to_node_color(request_hash);
+			double edge_mult = 0.8;
+			double edge_label_mult = 0.6;
+			color_t edge_color =
+			    node_to_edge_color(node_color, edge_mult);
+			color_t edge_label_color =
+			    node_to_edge_color(node_color, edge_label_mult);
 
 			fprintf(out,
 "    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\", "
                                     "fontsize=%d, "
+				    "style=\"%s\", "
 				    "color=" COLOR_FMT ", "
 				    "fontcolor=" COLOR_FMT ", "
 				    "penwidth=%lf];\n",
-			    rid, edge->rid, pct, edge->nhits, font_size,
-			    edge_color, edge_color, pen_width);
+			    rid, edge->rid, pct, edge->nhits, font_size, style,
+			    edge_color, edge_label_color, pen_width);
 		}
 	}
 
