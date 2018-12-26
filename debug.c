@@ -2,6 +2,70 @@
 #include <stdio.h>
 
 #include "debug.h"
+#include "field.h"
+
+void
+debug_line_config(struct line_config *lc)
+{
+//struct line_config {
+//	int    rfc3339;   /* Index to RFC3339 timestamp; REQUIRED */
+//	int    ipaddr;    /* IP address;  optional */
+//	int    request;   /* Index to request field;     REQUIRED */
+//	int    useragent; /* Index to user agent string; optional */
+//
+//	int         ntotal_fields;
+//	int         nfields;
+//	struct      field_idx indices[NFIELD_TYPES];
+//	const char *session_fields;
+//
+//	regex_t regexes[NFIELD_TYPES];
+//};
+
+	printf("----- BEGIN LINE CONFIG -----\n");
+	printf(
+"- ntotal_field_info: %zu\n"
+"- total_field_info:\n",
+	    lc->ntotal_field_info);
+	for(size_t i = 0; i < NFIELD_TYPES; i++) {
+		struct field_info *fi = &lc->total_field_info[i];
+		printf(
+"    [%zu]:\n"
+"        - type: %s\n"
+"        - index: %d\n"
+"        - nmatches: %zu\n"
+"        - is_session: %s\n"
+"        - is_custom: %s\n",
+		    i,
+		    field_type_str(fi->type),
+		    fi->index,
+		    fi->nmatches,
+		    fi->is_session ? "true" : "false",
+		    fi->is_custom ? "true" : "false");
+	}
+
+	printf(
+"- nscan_field_info: %zu\n"
+"- scan_field_info:\n",
+	    lc->nscan_field_info);
+	for(size_t i = 0; i < lc->nscan_field_info; i++) {
+		struct field_info *fi = &lc->scan_field_info[i];
+		printf(
+"    [%zu]:\n"
+"        - type: %s\n"
+"        - index: %d\n"
+"        - nmatches: %zu\n"
+"        - is_session: %s\n"
+"        - is_custom: %s\n",
+		    i,
+		    field_type_str(fi->type),
+		    fi->index,
+		    fi->nmatches,
+		    fi->is_session ? "true" : "false",
+		    fi->is_custom ? "true" : "false");
+	}
+
+	printf("----- END LINE CONFIG -----\n");
+}
 
 void
 debug_truncate_patterns(struct truncate_patterns *tp)

@@ -3,6 +3,6 @@
 
 #include <stdint.h>
 
-uint64_t ts_rfc3339_to_ms(const char *);
+uint64_t rfc3339_to_ms(const char *);
 
 #endif

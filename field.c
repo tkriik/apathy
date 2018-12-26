@@ -1,9 +1,55 @@
 #include <assert.h>
+#include <regex.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "field.h"
+#include "regex.h"
 #include "util.h"
+
+static const enum field_type FIELD_TYPES[NFIELD_TYPES] = {
+	FIELD_RFC3339,
+	FIELD_DATE,
+	FIELD_TIME,
+
+	FIELD_IPADDR,
+	FIELD_USERAGENT,
+
+	FIELD_REQUEST,
+	FIELD_METHOD,
+	FIELD_PROTOCOL,
+	FIELD_DOMAIN,
+	FIELD_ENDPOINT
+};
+
+#define RFC3339_PATTERN   "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+#define DATE_PATTERN      "^[0-9]{4}-[0-9]{2}-[0-9]{2}"
+#define TIME_PATTERN      "^[0-9]{2}:[0-9]{2}:[0-9]{2}"
+
+#define IPV4_PATTERN      "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
+#define USERAGENT_PATTERN "^(Mozilla|http-kit)"
+
+#define REQUEST_PATTERN   "^(GET|HEAD|POST|PUT|OPTIONS|PATCH)\\s+(http|https)://.+"
+#define METHOD_PATTERN    "^(GET|HEAD|POST|PUT|OPTIONS|PATCH)$"
+#define PROTOCOL_PATTERN  "^(http|https)$"
+//#define DOMAIN_PATTERN    "^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$" TODO: fix
+#define DOMAIN_PATTERN    "^.+\\..+$"
+#define ENDPOINT_PATTERN  "^\\/.+$"
+
+static const char *FIELD_PATTERNS[NFIELD_TYPES] = {
+	[FIELD_RFC3339]   = RFC3339_PATTERN,
+	[FIELD_DATE]      = DATE_PATTERN,
+	[FIELD_TIME]      = TIME_PATTERN,
+
+	[FIELD_IPADDR]    = IPV4_PATTERN,
+	[FIELD_USERAGENT] = USERAGENT_PATTERN,
+
+	[FIELD_REQUEST]   = REQUEST_PATTERN,
+	[FIELD_METHOD]    = METHOD_PATTERN,
+	[FIELD_PROTOCOL]  = PROTOCOL_PATTERN,
+	[FIELD_DOMAIN]    = DOMAIN_PATTERN,
+	[FIELD_ENDPOINT]  = ENDPOINT_PATTERN
+};
 
 /*
  * Fills *fvs with at most max_fields number of field views
@@ -22,7 +68,7 @@
  *
  * TODO: use strspn(3), strcspn(3)
  */
-int
+size_t
 get_fields(struct field_view *fvs, int max_fields, const char *src,
            int skip_line_seek, const char **endp)
 {
@@ -132,149 +178,321 @@ fill_fields:
 	}
 }
 
+const char *
+field_type_str(enum field_type ftype)
+{
+	static const char *table[NFIELD_TYPES] = {
+		[FIELD_RFC3339]   = "rfc3339",
+		[FIELD_DATE]      = "date",
+		[FIELD_TIME]      = "time",
+
+		[FIELD_IPADDR]    = "ipaddr",
+		[FIELD_USERAGENT] = "useragent",
+
+		[FIELD_REQUEST]   = "request",
+		[FIELD_METHOD]    = "method",
+		[FIELD_PROTOCOL]  = "protocol",
+		[FIELD_DOMAIN]    = "domain",
+		[FIELD_ENDPOINT]  = "endpoint"
+	};
+
+	if (ftype == FIELD_UNKNOWN)
+		return "UNKNOWN";
+
+	if (ftype < NFIELD_TYPES)
+		return table[ftype];
+
+	return "INVALID";
+}
+
 enum field_type
-infer_field_type(struct field_view *fv, struct regex_info *rx_info)
+infer_field_type(struct line_config *lc, struct field_view *fv)
 {
 #define FIELD_MAX 4096
 	char field[FIELD_MAX + 1] = {0};
 	int ncopy = MIN(fv->len, FIELD_MAX);
 	memcpy(field, fv->src, ncopy);
 
-	if (regex_does_match(&rx_info->rfc3339, field))
-		return FIELD_TS_RFC3339;
-
-	if (regex_does_match(&rx_info->ipv4, field))
-		return FIELD_IPADDR;
-
-	if (regex_does_match(&rx_info->request, field))
-		return FIELD_REQUEST;
-
-	if (regex_does_match(&rx_info->useragent, field))
-		return FIELD_USERAGENT;
+	for (size_t i = 0; i < NFIELD_TYPES; i++) {
+		enum field_type ftype = FIELD_TYPES[i];
+		regex_t *r = &lc->regexes[ftype];
+		if (regex_does_match(r, field)) {
+			return ftype;
+		}
+	}
 
 	return FIELD_UNKNOWN;
 }
 
 void
-amend_line_config(struct line_config *lc, enum field_type ftype, int idx)
+amend_line_config(struct line_config *lc, enum field_type ftype, size_t idx)
 {
-	if (LC_FIELDS_MAX <= lc->nfields)
+	assert(ftype < NFIELD_TYPES);
+
+	if (NFIELD_TYPES <= lc->ntotal_field_info)
 		return;
 
-	int is_session = 0;;
-
-	switch (ftype) {
-	case FIELD_TS_RFC3339:
-		if (lc->ts_rfc3339 == -1)
-			lc->ts_rfc3339 = idx;
-		else
-			return;
-		break;
-	case FIELD_IPADDR:
-		if (lc->ip1 == -1) {
-			lc->ip1 = idx;
-			if (strstr(lc->sfields, "ip1") != NULL)
-				is_session = 1;
-		} else if (lc->ip2 == -1) {
-			lc->ip2 = idx;
-			if (strstr(lc->sfields, "ip2") != NULL)
-				is_session = 1;
-		} else
-			return;
-		break;
-	case FIELD_REQUEST:
-		if (lc->request == -1)
-			lc->request = idx;
-		else
-			return;
-		break;
-	case FIELD_USERAGENT:
-		if (lc->useragent == -1) {
-			lc->useragent = idx;
-			if (strstr(lc->sfields, "useragent") != NULL)
-				is_session = 1;
-		} else
-			return;
-		break;
-	default:
+	struct field_info *fi = &lc->total_field_info[ftype];
+	if (fi->is_custom)
 		return;
+
+	if (lc->active_fields[idx] != FIELD_UNKNOWN) {
+		ERRX("cannot re-use field '%s' at index %zu for field '%s'",
+		    field_type_str(lc->active_fields[idx]),
+		    idx,
+		    field_type_str(ftype));
 	}
 
-	lc->indices[lc->nfields] = (struct field_idx){
-		.type       = ftype,
-		.i          = idx,
-		.is_session = is_session
-	};
-	lc->nfields++;
+	if (fi->type == FIELD_UNKNOWN) {
+		fi->type = ftype;
+		fi->index = idx;
+		lc->ntotal_field_info++;
+		lc->active_fields[idx] = ftype;
+	}
+
+	fi->nmatches++;
+
+	if (1 < fi->nmatches)
+		WARNX(
+"multiple matches for field '%s', "
+"consider using the '--index %s=...' command line option "
+"for specifying a custom field index",
+		    field_type_str(ftype),
+		    field_type_str(ftype));
+
 }
 
-void
-check_line_config(struct line_config *lc)
+static int
+is_field_set(struct line_config *lc, enum field_type ftype)
 {
-	if (lc->ip1 == -1 || lc->ip2 == -1)
-		WARNX("%s", "source and/or destination IP address fields not found");
-	if (lc->useragent == -1)
-		WARNX("%s", "user agent field not found");
-	if (lc->ts_rfc3339 == -1)
-		ERRX("%s", "timestamp field not found");
-	if (lc->request == -1)
-		ERRX("%s", "request field not found");
-	if (lc->ip1 == -1 && lc->ip2 == -1 && lc->useragent == -1)
-		ERRX("%s", "source IP address, destination IP address nor user agent field found");
+	assert(ftype < NFIELD_TYPES);
+	return lc->total_field_info[ftype].type == ftype;
+}
+
+static int
+is_session_field(struct line_config *lc, enum field_type ftype)
+{
+	assert(ftype < NFIELD_TYPES);
+	return lc->total_field_info[ftype].is_session;
+}
+
+static void
+set_scan_field(struct line_config *lc, enum field_type ftype)
+{
+	assert(is_field_set(lc, ftype));
+	assert(lc->nscan_field_info < lc->ntotal_field_info);
+	lc->scan_field_info[lc->nscan_field_info++] = lc->total_field_info[ftype];
+	assert(lc->nscan_field_info <= lc->ntotal_field_info);
+}
+
+static void
+init_scan_fields(struct line_config *lc)
+{
+	if (is_field_set(lc, FIELD_RFC3339)) {
+		set_scan_field(lc, FIELD_RFC3339);
+	} else if (is_field_set(lc, FIELD_DATE) && is_field_set(lc, FIELD_TIME)) {
+		set_scan_field(lc, FIELD_DATE);
+		set_scan_field(lc, FIELD_TIME);
+	} else {
+		ERRX("%s", "could not find RFC3339 timestamp, nor date and time fields");
+	}
+
+	if (is_session_field(lc, FIELD_IPADDR)) {
+		if (is_field_set(lc, FIELD_IPADDR))
+			set_scan_field(lc, FIELD_IPADDR);
+		else
+			ERRX("%s", "could not find IP address field");
+	}
+
+	if (is_session_field(lc, FIELD_USERAGENT)) {
+		if (is_field_set(lc, FIELD_USERAGENT))
+			set_scan_field(lc, FIELD_USERAGENT);
+		else
+			ERRX("%s", "could not find user agent field");
+	}
+
+	if (is_field_set(lc, FIELD_REQUEST)) {
+		set_scan_field(lc, FIELD_REQUEST);
+	} else if (is_field_set(lc, FIELD_METHOD)
+	        && is_field_set(lc, FIELD_DOMAIN)
+		&& is_field_set(lc, FIELD_ENDPOINT)) {
+		set_scan_field(lc, FIELD_METHOD);
+		set_scan_field(lc, FIELD_DOMAIN);
+		set_scan_field(lc, FIELD_ENDPOINT);
+	} else {
+		ERRX("%s", "could not find request, nor method, domain and endpoint fields");
+	}
+}
+
+static void override_line_config(struct line_config *, const char *);
+
+static struct field_info *
+get_field_info(struct line_config *lc, enum field_type ftype)
+{
+	assert(ftype < NFIELD_TYPES);
+
+	return &lc->total_field_info[ftype];
+}
+
+static void
+parse_session_fields(struct line_config *lc, const char *session_fields)
+{
+	assert(lc != NULL);
+	assert(session_fields != NULL);
+
+	char buf[64] = {0};
+	int ncopy = MIN(strlen(session_fields), sizeof(buf) - 1);
+	memcpy(buf, session_fields, ncopy);
+
+	char *s = buf;
+	char *endp = s;
+	while ((s = strtok(endp, ",")) != NULL) {
+		endp = NULL;
+		struct field_info *fi;
+		if (strcmp(s, "ipaddr") == 0) {
+			fi = get_field_info(lc, FIELD_IPADDR);
+			fi->is_session = 1;
+			continue;
+		}
+
+		if (strcmp(s, "useragent") == 0) {
+			fi = get_field_info(lc, FIELD_USERAGENT);
+			fi->is_session = 1;
+			continue;
+		}
+
+		ERRX("invalid session field: '%s'", s);
+	}
 }
 
 void
 init_line_config(struct line_config *lc, struct file_view *log_view,
-		 struct regex_info *rx_info, const char *session_fields)
+		 const char *index_fields, const char *session_fields)
 {
 	assert(lc != NULL);
 	assert(log_view != NULL);
-	assert(rx_info != NULL);
+	assert(session_fields != NULL);
 
 	const char *src = log_view->src;
 
 	memset(lc, 0, sizeof(*lc));
 	*lc = (struct line_config){
-		.ts_rfc3339    = -1,
-		.ip1           = -1,
-		.ip2           = -1,
-		.request       = -1,
-		.useragent     = -1,
-
-		.ntotal_fields =  0,
-		.nfields       =  0,
-		.sfields       = session_fields
+	    .nall_fields       = 0,
+	    .ntotal_field_info = 0,
+	    .nscan_field_info  = 0
 	};
 
-	struct field_view fvs[NFIELDS_MAX] = {0};
+	static const struct field_info null_field_info = {
+		.type       = FIELD_UNKNOWN,
+		.index      = -1,
+		.nmatches   = 0,
+		.is_session = 0,
+		.is_custom  = 0
+	};
+
+	for (size_t i = 0; i < NFIELD_TYPES; i++) {
+		lc->total_field_info[i] = null_field_info;
+		lc->scan_field_info[i] = null_field_info;
+	}
+
+	for (size_t i = 0; i < NALL_FIELDS_MAX; i++)
+		lc->active_fields[i] = FIELD_UNKNOWN;
+
+	int cflags = REG_EXTENDED | REG_NOSUB | REG_NEWLINE;
+	for (size_t i = 0; i < NFIELD_TYPES; i++) {
+		enum field_type ftype = FIELD_TYPES[i];
+		const char *pattern = FIELD_PATTERNS[ftype];
+		regex_t *re = &lc->regexes[ftype];
+		compile_regex(re, pattern, cflags);
+	}
+
+	parse_session_fields(lc, session_fields);
+
+	struct field_view fvs[NALL_FIELDS_MAX] = {0};
 	const char *endp;
-	int nfields = get_fields(fvs, NFIELDS_MAX, src, 1, &endp);
-	lc->ntotal_fields = nfields;
-	for (int i = 0; i < nfields; i++) {
+	size_t nall_fields = get_fields(fvs, NALL_FIELDS_MAX, src, 1, &endp);
+	if (nall_fields == NALL_FIELDS_MAX)
+		WARNX("found possibly more than %d fields, ignoring the rest", NALL_FIELDS_MAX);
+
+	lc->nall_fields = nall_fields;
+
+	if (index_fields != NULL)
+		override_line_config(lc, index_fields);
+
+	for (size_t i = 0; i < nall_fields; i++) {
 		struct field_view *fv = &fvs[i];
-		enum field_type ftype = infer_field_type(fv, rx_info);
+		enum field_type ftype = infer_field_type(lc, fv);
+		if (ftype == FIELD_UNKNOWN)
+			continue;
+
 		amend_line_config(lc, ftype, i);
 	}
 	
-	check_line_config(lc);
+	init_scan_fields(lc);
 }
 
-void
-validate_session_fields(const char *session_fields)
+static enum field_type
+str_to_field_type(const char *s)
 {
-	char buf[64] = {0};
-	int ncopy = MIN(strlen(session_fields), sizeof(buf) - 1);
-	memcpy(buf, session_fields, ncopy);
+	const static struct {
+		const char *name;
+		enum field_type type;
+	} table[NFIELD_TYPES] = {
+	    { "rfc3339",   FIELD_RFC3339   },
+	    { "date",      FIELD_DATE,     },
+	    { "time",      FIELD_TIME,     },
+	    { "useragent", FIELD_USERAGENT },
+	    { "ipaddr",    FIELD_IPADDR    },
+	    { "request",   FIELD_REQUEST   },
+	    { "method",    FIELD_METHOD    },
+	    { "protocol",  FIELD_PROTOCOL  },
+	    { "domain",    FIELD_DOMAIN    },
+	    { "endpoint",  FIELD_ENDPOINT  }
+	};
+
+	for (size_t i = 0; i < NFIELD_TYPES; i++) {
+		if (strcmp(table[i].name, s) == 0)
+			return table[i].type;
+	}
+
+	return FIELD_UNKNOWN;
+}
+
+static void
+override_line_config(struct line_config *lc, const char *index_fields)
+{
+	assert(lc != NULL);
+	assert(index_fields != NULL);
+
+	char buf[256] = {0};
+	size_t ncopy = MIN(strlen(index_fields), sizeof(buf) - 1);
+	memcpy(buf, index_fields, ncopy);
+
 	char *s = buf;
 	char *endp = s;
+
 	while ((s = strtok(endp, ",")) != NULL) {
 		endp = NULL;
-		if (strcmp(s, "ip1") == 0)
-			continue;
-		if (strcmp(s, "ip2") == 0)
-			continue;
-		if (strcmp(s, "useragent") == 0)
-			continue;
-		errx(1, "error: invalid session field: %s\n", s);
+		const char *field = s;
+		size_t field_len = strcspn(s, "=");
+		s[field_len] = '\0';
+
+		const char *indexp = s + field_len + 1;
+		int index = parse_long(indexp);
+		if (index < 0 || lc->nall_fields <= (size_t)index) {
+			ERRX("index for field '%s' out of range: %d\n",
+			    field, index);
+		}
+
+		enum field_type ftype = str_to_field_type(field);
+		if (ftype == FIELD_UNKNOWN)
+			ERRX("unknown field type: '%s'", field);
+
+		struct field_info *fi = &lc->total_field_info[ftype];
+		fi->type = ftype;
+		fi->index = index;
+		fi->is_custom = 1;
+		lc->active_fields[index] = ftype;
+		lc->ntotal_field_info++;
 	}
 }

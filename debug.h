@@ -1,11 +1,13 @@
 #ifndef DEBUG_H
 #define DEBUG_H
 
+#include "field.h"
 #include "path_graph.h"
 #include "request.h"
 #include "session.h"
 #include "truncate.h"
 
+void debug_line_config(struct line_config *);
 void debug_truncate_patterns(struct truncate_patterns *);
 void debug_request_set(struct request_set *);
 void debug_request_table(struct request_table *);

@@ -8,7 +8,7 @@
  * we can take this faster shortcut with manual parsing.
  */
 uint64_t
-ts_rfc3339_to_ms(const char *s)
+rfc3339_to_ms(const char *s)
 {
 	static const char ctoi[256] = {
 	    ['0'] = 0, ['1'] = 1, ['2'] = 2, ['3'] = 3, ['4'] = 4,

@@ -4,68 +4,56 @@
 #include "file_view.h"
 #include "regex.h"
 
+#define NFIELD_TYPES 10
 enum field_type {
-	FIELD_TS_RFC3339 = 1,
+	FIELD_RFC3339 = 0,
+	FIELD_DATE,
+	FIELD_TIME,
+
 	FIELD_IPADDR,
-	FIELD_REQUEST,
 	FIELD_USERAGENT,
+
+	FIELD_REQUEST,
+	FIELD_METHOD,
+	FIELD_PROTOCOL,
+	FIELD_DOMAIN,
+	FIELD_ENDPOINT,
+	/* TODO: query */
+
 	FIELD_UNKNOWN
 };
 
-/*
- * View to a single field in a line.
- * We limit field views to 256 to avoid memory allocation.
- */
 struct field_view {
-#define NFIELDS_MAX 256
 	int         len;
 	const char *src;
 };
 
-/* Tells what type of field lies at a certain index. */
-struct field_idx {
-	enum field_type type;
-	int  i;
-	int  is_session; /* 1 if this field is used to construct session IDs */
+struct field_info {
+	enum   field_type type;
+	int    index;
+	size_t nmatches;
+	int    is_session;
+	int    is_custom;
 };
 
-/*
- * This is used to index certain fields in each line.
- *
- * The program reads the first line of a log file and uses that to
- * infer indices of fields relevant to us, so that when we are doing
- * a full scan we can find the desired fields more quickly.
- *
- * This only works if each line contains the same number of fields in
- * same order, but that should not be a problem with most log files.
- *
- * All of the 5 indices below are -1 if they're not found.
- */
 struct line_config {
-#define LC_FIELDS_MAX 5
-	int    ts_rfc3339; /* Index to RFC3339 timestamp; REQUIRED */
-	int    ip1;        /* Index to first IP address;  optional */
-	int    ip2;        /* Index to second IP address; optional */
-	int    request;    /* Index to request field;     REQUIRED */
-	int    useragent;  /* Index to user agent string; optional */
-	/*
-	 * XXX:
-	 * While the IP address fields and user agent fields are optional
-	 * individually, it's required to have at least one of the three
-	 * to get any meaningful path info out of the log file.
-	 */
+	regex_t     regexes[NFIELD_TYPES];
 
-	int         ntotal_fields;
-	int         nfields;
-	struct      field_idx indices[LC_FIELDS_MAX + 1];
-	const char *sfields;
+	size_t  nall_fields;
+#define NALL_FIELDS_MAX 512
+	enum    field_type active_fields[NALL_FIELDS_MAX];
+
+	size_t  ntotal_field_info;
+	struct  field_info total_field_info[NFIELD_TYPES];
+
+	size_t nscan_field_info;
+	struct field_info scan_field_info[NFIELD_TYPES];
 };
 
-int  get_fields(struct field_view *, int, const char *, int , const char **);
-enum field_type infer_field_type(struct field_view *, struct regex_info *);
-void amend_line_config(struct line_config *, enum field_type, int);
-void check_line_config(struct line_config *);
-void init_line_config(struct line_config *, struct file_view *, struct regex_info *, const char *);
-void validate_session_fields(const char *);
+size_t      get_fields(struct field_view *, int, const char *, int , const char **);
+enum        field_type infer_field_type(struct line_config *, struct field_view *);
+const char *field_type_str(enum field_type);
+void        amend_line_config(struct line_config *, enum field_type, size_t);
+void        init_line_config(struct line_config *, struct file_view *, const char *, const char *);
 
 #endif

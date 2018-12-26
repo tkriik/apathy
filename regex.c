@@ -21,18 +21,6 @@ compile_regex(regex_t *preg, const char *pattern, int cflags)
 	}
 }
 
-void
-init_regex_info(struct regex_info *rx_info)
-{
-	assert(rx_info != NULL);
-
-	int cflags = REG_EXTENDED | REG_NOSUB | REG_NEWLINE;
-	compile_regex(&rx_info->rfc3339, RFC3339_PATTERN, cflags);
-	compile_regex(&rx_info->ipv4, IPV4_PATTERN, cflags);
-	compile_regex(&rx_info->request, REQUEST_PATTERN, cflags);
-	compile_regex(&rx_info->useragent, USERAGENT_PATTERN, cflags);
-}
-
 int
 regex_does_match(regex_t *preg, const char *s)
 {

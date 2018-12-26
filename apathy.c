@@ -118,7 +118,6 @@ struct thread_chunk {
 /* Thread-specific context. */
 struct thread_ctx {
 	int    tid;
-
 	struct file_view *log_view;
 	struct line_config *line_config;
 	struct truncate_patterns *truncate_patterns;
@@ -159,27 +158,27 @@ run_thread(void *ctx)
 			break;
 
 		int skip_line_seek = log_view->src == src;
-		struct field_view fvs[NFIELDS_MAX] = {0};
+		struct field_view fvs[NALL_FIELDS_MAX] = {0};
 
-		int nfields = get_fields(fvs, NFIELDS_MAX, src, skip_line_seek, &src);
-		if (nfields != lc->ntotal_fields)
+		size_t nfields = get_fields(fvs, NALL_FIELDS_MAX, src, skip_line_seek, &src);
+		if (nfields != lc->nall_fields)
 			continue;
 
 		uint64_t ts = 0;
 		session_id_t sid = hash64_init();
 		request_id_t rid;
 
-		for (int i = 0; i < lc->nfields; i++) {
-			struct field_idx *fidx = &lc->indices[i];
-			struct field_view *fv = &fvs[fidx->i];
+		for (size_t i = 0; i < lc->nscan_field_info; i++) {
+			struct field_info *fi = &lc->scan_field_info[i];
+			struct field_view *fv = &fvs[fi->index];
 
-			if (fidx->is_session) {
+			if (fi->is_session) {
 				sid = hash64_update(sid, fv->src, fv->len);
 			}
 
-			switch (fidx->type) {
-			case FIELD_TS_RFC3339:
-				ts = ts_rfc3339_to_ms(fv->src);
+			switch (fi->type) {
+			case FIELD_RFC3339:
+				ts = rfc3339_to_ms(fv->src);
 				break;
 			case FIELD_REQUEST:
 				rid = add_request_set_entry(rs, fv->src, tp);
@@ -274,14 +273,13 @@ finish_work_ctx(struct work_ctx *work_ctx)
 int
 main(int argc, char **argv)
 {
-	//char *merge_patterns  = NULL;
-	const char *session_fields = "ip1,useragent";
+	const char *index_fields = NULL;
+	const char *session_fields = "ipaddr,useragent";
 	const char *truncate_patterns_path = NULL;
 	long nthreads = -1;
 
 	struct file_view log_view;
 	struct truncate_patterns tp;
-	struct regex_info rx_info;
 	struct line_config lc;
 	struct request_set rs;
 	struct request_table rt;
@@ -301,7 +299,7 @@ main(int argc, char **argv)
 			{"concurrency",       required_argument, 0, 'C' },
 			{"format",            required_argument, 0, 'f' },
 			{"help",              no_argument,       0, 'h' },
-			{"ignore-patterns",   required_argument, 0, 'I' },
+			{"index",             required_argument, 0, 'i' },
 			{"truncate-patterns", required_argument, 0, 'T' },
 			{"output",            required_argument, 0, 'o' },
 			{"session",           required_argument, 0, 'S' },
@@ -309,7 +307,7 @@ main(int argc, char **argv)
 			{0,                   0,                 0,  0  }
 		};
 
-		int c = getopt_long(argc, argv, "C:f:hI:T:M:o:S:V", long_opts, &opt_idx);
+		int c = getopt_long(argc, argv, "C:f:hi:I:T:M:o:S:V", long_opts, &opt_idx);
 		if (c == -1)
 			break;
 
@@ -330,6 +328,9 @@ main(int argc, char **argv)
 		case 'h':
 			usage();
 			break;
+		case 'i':
+			index_fields = optarg;
+			break;
 		case 'o':
 			output_path = optarg;
 			if (strcmp(output_path, "-") != 0) {
@@ -340,7 +341,6 @@ main(int argc, char **argv)
 			break;
 		case 'S':
 			session_fields = optarg;
-			validate_session_fields(session_fields);
 			break;
 		case 'T':
 			truncate_patterns_path = optarg;
@@ -368,8 +368,7 @@ main(int argc, char **argv)
 		memset(&tp, 0, sizeof(tp));
 	//debug_truncate_patterns(&tp);
 
-	init_regex_info(&rx_info);
-	init_line_config(&lc, &log_view, &rx_info, session_fields);
+	init_line_config(&lc, &log_view, index_fields, session_fields);
 	init_request_set(&rs);
 	init_session_map(&sm);
 
@@ -416,15 +415,20 @@ usage(void)
 "    -C, --concurrency <num_threads>         Number of worker threads\n"
 "                                              default: number of logical CPU cores, or 4 as a fallback\n"
 "\n"
-"    -I, --ignore-patterns <pattern_file>    File containing URL patterns for ignoring HTTP requests\n"
+"    -i, --index <field_indices>             Comma-separated list of field-to-index assignments\n"
+"                                              available fields: rfc3339 date time\n"
+"                                                                request method protocol domain endpoint\n"
+"                                                                ipaddr useragent\n"
+"                                              example: rfc3339=1,ipaddr=2,request=5,useragent=8\n"
+"\n"
 "    -T, --truncate-patterns <pattern_file>  File containing URL patterns for merging HTTP requests\n"
 "\n"
 "    -o, --output <output_file>              File for output\n"
 "                                              default: \"-\" (standard output)\n"
 "\n"
 "    -S, --session <session_fields>          Comma-separated fields used to construct a session ID for a request\n"
-"                                              available fields: ip1,ip2,useragent\n"
-"                                              default: ip1,useragent\n"
+"                                              available fields: ipaddr useragent\n"
+"                                              default: ipaddr,useragent\n"
 "\n"
 "ARGUMENTS:\n"
 "    <ACCESS_LOG>    Access log file containing HTTP request timestamps, IP addresses, methods, URLs and User Agent headers\n",

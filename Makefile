@@ -5,7 +5,7 @@ CFLAGS=		-std=c99 \
 		-Wall \
 		-Wextra \
 		-D_DEFAULT_SOURCE \
-		-O2
+		-O0
 
 LDFLAGS=	-lm -lpthread
 
@@ -20,7 +20,8 @@ SRC=		apathy.c \
 		request.c \
 		session.c \
 		time.c \
-		truncate.c
+		truncate.c \
+		util.c
 
 BIN=		apathy
 
