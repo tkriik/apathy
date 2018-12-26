@@ -9,7 +9,19 @@ CFLAGS=		-std=c99 \
 
 LDFLAGS=	-lm -lpthread
 
-SRC=		apathy.c
+SRC=		apathy.c \
+		debug.c \
+		dot.c \
+		field.c \
+		file_view.c \
+		hash.c \
+		path_graph.c \
+		regex.c \
+		request.c \
+		session.c \
+		time.c \
+		truncate.c
+
 BIN=		apathy
 
 all: $(BIN)
