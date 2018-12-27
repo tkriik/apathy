@@ -322,6 +322,9 @@ init_scan_fields(struct line_config *lc)
 	} else {
 		ERRX("%s", "could not find request, nor method, domain and endpoint fields");
 	}
+
+	if (is_field_set(lc, FIELD_PROTOCOL))
+		set_scan_field(lc, FIELD_PROTOCOL);
 }
 
 static void override_line_config(struct line_config *, const char *);
@@ -479,11 +482,12 @@ override_line_config(struct line_config *lc, const char *index_fields)
 
 		const char *indexp = s + field_len + 1;
 		int index = parse_long(indexp);
-		if (index < 0 || lc->nall_fields <= (size_t)index) {
+		if (index < 1 || lc->nall_fields < (size_t)index) {
 			ERRX("index for field '%s' out of range: %d\n",
 			    field, index);
 		}
 
+		index -= 1;
 		enum field_type ftype = str_to_field_type(field);
 		if (ftype == FIELD_UNKNOWN)
 			ERRX("unknown field type: '%s'", field);

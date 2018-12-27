@@ -82,12 +82,25 @@ From the image we can observe at least the following facts:
   * `GET http://my-api/health` has been called 3 times, consisting of 2
     repeats, so it's probably from a monitoring service.
 
+Other notes:
+
+  * The more calls an endpoint has, the larger the node
+  * The more hits an edge has, the thicker the line between two nodes
+  * Edge lines from a lower depth node to an equal or higher depth node
+    are solid, while those from a lower depth node to a higher depth one
+    are dashed.
+  * Edge lines between a single node are dotted, as seen with the health
+    endpoint.
+  * Nodes are grouped by their minimum call depth from left to right,
+    so that nodes on the left tend to be the first to be called, while
+    those on the right tend to occur deeper during each session.
+
 ### How?
 
 The program constructs a *session ID* from each HTTP log entry,
 using the user agent and first IPv4 address by default. It uses
 this information to construct a call path for each session, after
-which we can generate a call graph like above.
+which we can generate a graph like above.
 
 
 INSTALL
@@ -105,30 +118,81 @@ USAGE
 
 See `./apathy --help` for command-line reference.
 
-The program expects that any log files fed to it contain
-at least the following fields:
+### Log file
 
-  * RFC3339-formatted timestamp with millisecond precision.
-    - example: `2018-01-01T12:30:00.400`
-  * Request field, surrounded by double quotes, with the method and URL inside.
-    - example: `"GET https://my-api/v1/data?limit=50 HTTP/1.0"`
+#### Date fields
 
-Additionally, at least one of the following fields must be present,
-in order to identify meaningul session information:
+One of the two variants below must be found:
 
-  * Source IPv4 address, with or without a port number.
-    - examples: `127.0.0.1:5000` or `10.1.1.50`
-  * User agent string, surrounded by double quotes.
-    - example: `"Mozilla 5.0 ..."`
+  * A single RFC3339-formatted timstamp field with millisecond precision
+    - example: `2018-12-12T12:00:01.000Z`
+  * Separate date and time fields, where date is in `YYYY-MM-DD` format,
+    and time is in `HH:mm:SS` format.
+    - example: `2018-12-12    12:00:01`
+
+#### Session fields
+
+One of the two fields below must be found:
+
+  * An IP address field, with or without a port suffix.
+    - examples: `127.0.0.1`, `127.0.0.1:5000`
+  * A user agent string, enclosed by double quotes if it contains whitespace.
+    - example: `"Mozilla/5.0 ..."`
+
+#### Request fields
+
+One of the two variants must be found:
+
+  * A full request field, surrounded by double quotes, with the method and URL inside.
+    - example: `"GET https://my-api/v1/data?limit=50 ..."`
+  * Separate method, protocol (optional), domain and endpoint fields.
+    - examples: `my-api.foo   GET   https   /v1/data`
+
+### Custom field indices
+
+The program tries its best to infer what kind of field lies at each column,
+but might find multiple valid matches for a certain field.
+
+For example, the line below:
+
+    2018-12-10  10:00:10    DUB2    615 127.0.0.1   GET foobar.cloudfront.net   /login  200 Mozilla/5.0             id=user1    my-api.foo  https   HTTP/1.1
+
+...has two valid indices for the domain field, being 7 (`foobar.cloudfront.net`)
+and 12 (`my-api.foo`). In this case, you probably want to use the field
+at index 12, so use the `-i` / `--index` command line option to override
+it:
+
+    $ ./apathy --index domain=12 $MY_LOG_FILE
+
+### Truncate patterns
+
+If your log file contains endpoint that take path parameters, such as
+UUIDs, then you probably want to combine their occurrences. You may do
+this manually with a tool like `sed`,
+but you may also use the `-T` / `--truncate-patterns` command line option
+to point to a file, that contains the patterns you want to truncate.
+
+For example, using the file at `examples/truncate.txt`:
+
+    # Truncate UUIDs (this line is a comment)
+    $UUID = [0-9a-fA-F]{8}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{4}\-[0-9a-fA-F]{12}
+
+...would merge the two following requests below:
+
+    GET http://my-api/token/37bd1951-91e0-43ea-a313-ba3074e46ec7/data/131b0ae8-b7df-4d4d-a35c-5b10d1948de3
+    GET http://my-api/token/1ccad17e-a51c-4a6b-9f35-d877f2bbd452/data/bcacc232-8173-4cf7-bc12-7591f9f686dd
+
+...into this:
+
+    GET http://my-api/token/$UUID/data/$UUID
 
 
 TODO
 ----
 
-  * IP without port sessions
-  * custom session fields
+  * IP without port
+  * RFC3339 without milliseconds
   * duration info
-  * non-surrounded request fields
   * query parameter session IDs
-  * IPv6 source and destination addresses
-  * ignore patterns
+  * IPv6
+  * ignore-patterns

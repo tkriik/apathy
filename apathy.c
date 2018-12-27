@@ -166,6 +166,14 @@ run_thread(void *ctx)
 
 		uint64_t ts = 0;
 		session_id_t sid = hash64_init();
+		struct request_info ri = {
+			.request  = NULL,
+			.method   = NULL,
+			.protocol = NULL,
+			.domain   = NULL,
+			.endpoint = NULL
+		};
+
 		request_id_t rid;
 
 		for (size_t i = 0; i < lc->nscan_field_info; i++) {
@@ -178,16 +186,35 @@ run_thread(void *ctx)
 
 			switch (fi->type) {
 			case FIELD_RFC3339:
-				ts = rfc3339_to_ms(fv->src);
+				ts = rfc3339_with_ms_to_ms(fv->src);
+				break;
+			case FIELD_DATE:
+				ts += date_to_ms(fv->src, NULL);
+				break;
+			case FIELD_TIME:
+				ts += time_without_ms_to_ms(fv->src, NULL);
 				break;
 			case FIELD_REQUEST:
-				rid = add_request_set_entry(rs, fv->src, tp);
+				ri.request = fv->src;
+				break;
+			case FIELD_METHOD:
+				ri.method = fv->src;
+				break;
+			case FIELD_PROTOCOL:
+				ri.protocol = fv->src;
+				break;
+			case FIELD_DOMAIN:
+				ri.domain = fv->src;
+				break;
+			case FIELD_ENDPOINT:
+				ri.endpoint = fv->src;
 				break;
 			default:
 				break;
 			}
 		}
 
+		rid = add_request_set_entry(rs, &ri, tp);
 		amend_session_map_entry(sm, sid, ts, rid);
 	} 
 
@@ -369,6 +396,7 @@ main(int argc, char **argv)
 	//debug_truncate_patterns(&tp);
 
 	init_line_config(&lc, &log_view, index_fields, session_fields);
+	//debug_line_config(&lc);
 	init_request_set(&rs);
 	init_session_map(&sm);
 
@@ -419,6 +447,7 @@ usage(void)
 "                                              available fields: rfc3339 date time\n"
 "                                                                request method protocol domain endpoint\n"
 "                                                                ipaddr useragent\n"
+"                                              valid index: 1 - $NUMBER_OF_FIELDS\n"
 "                                              example: rfc3339=1,ipaddr=2,request=5,useragent=8\n"
 "\n"
 "    -T, --truncate-patterns <pattern_file>  File containing URL patterns for merging HTTP requests\n"

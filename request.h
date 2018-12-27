@@ -10,6 +10,14 @@
 typedef size_t request_id_t;
 #define PRIuRID "zu"
 
+struct request_info {
+	const char *request; /* If this is null, the fields below are set, and vice versa. */
+	const char *method;
+	const char *protocol;
+	const char *domain;
+	const char *endpoint;
+};
+
 /* Request field data and incremental ID, stored in a hash table. */
 struct request_set_entry {
 	const char   *data;
@@ -39,7 +47,7 @@ struct request_table {
 	uint64_t      *hashes;    /* Request ID to hash */
 };
 
-request_id_t add_request_set_entry(struct request_set *, const char *, struct truncate_patterns *);
+request_id_t add_request_set_entry(struct request_set *, struct request_info *, struct truncate_patterns *);
 
 void init_request_set(struct request_set *);
 void gen_request_table(struct request_table *, struct request_set *);

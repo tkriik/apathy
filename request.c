@@ -6,21 +6,9 @@
 #include "truncate.h"
 #include "util.h"
 
-/*
- * Stores a request field pointed to by src into the request set rs.
- * Returns a numeric request ID.
- */
-request_id_t
-add_request_set_entry(struct request_set *rs, const char *src,
-                      struct truncate_patterns *tp)
+static size_t
+init_raw_request_from_src(const char *src, char *raw_buf, size_t raw_size)
 {
-	assert(src != NULL);
-
-	size_t hash = hash64_init();
-	struct request_set_entry **handlep;
-	pthread_spinlock_t *bucket_lock;
-	struct request_set_entry *entry;
-
 	/* Compute request field length */
 	const char *s = src;
 	size_t method_size = strcspn(s, " ");
@@ -29,20 +17,89 @@ add_request_set_entry(struct request_set *rs, const char *src,
 	s += sep_size + 1;
 	size_t url_size = strcspn(s, "?\" \n");
 
-	size_t req_len = method_size + sep_size + url_size + 2;
+	size_t req_size = method_size + sep_size + url_size + 2;
+	if (raw_size < req_size)
+		WARNX("truncating request over %zu bytes long", raw_size);
+	req_size = MIN(req_size, raw_size);
+
+	memcpy(raw_buf, src, req_size);
+	raw_buf[req_size] = '\0';
+
+	return req_size;
+}
+
+static size_t
+init_raw_request_from_fields(struct request_info *ri, char *raw_buf, size_t raw_size)
+{
+	assert(ri->method != NULL);
+	assert(ri->domain != NULL);
+	assert(ri->endpoint != NULL);
+
+	size_t method_size = strcspn(ri->method, " \t");
+	size_t sep_size = 1;
+	size_t protocol_size = 0;
+	size_t protocol_sep_size = 0; /* ":// */
+	if (ri->protocol != NULL) {
+		protocol_size = strcspn(ri->protocol, " \t");
+		protocol_sep_size = 3;
+	}
+	size_t domain_size = strcspn(ri->domain, " \t");
+	size_t endpoint_size = strcspn(ri->endpoint, " \t");
+
+	size_t req_size = method_size + sep_size + protocol_size
+	    + protocol_sep_size + domain_size + endpoint_size;
+	if (raw_size < req_size)
+		WARNX("truncating request over %zu bytes long", raw_size);
+	req_size = MIN(req_size, raw_size);
+
+	char *s = raw_buf;
+	memcpy(s, ri->method, method_size);
+	s += method_size;
+	*s++ = ' ';
+	if (ri->protocol != NULL) {
+		memcpy(s, ri->protocol, protocol_size);
+		s += protocol_size;
+		memcpy(s, "://", protocol_sep_size);
+		s += protocol_sep_size;
+	}
+	memcpy(s, ri->domain, domain_size);
+	s += domain_size;
+	memcpy(s, ri->endpoint, endpoint_size);
+	s += endpoint_size;
+
+	raw_buf[req_size] = '\0';
+
+	return req_size;
+}
+
+/*
+ * Stores a request field pointed to by src into the request set rs.
+ * Returns a numeric request ID.
+ */
+request_id_t
+add_request_set_entry(struct request_set *rs, struct request_info *ri,
+                      struct truncate_patterns *tp)
+{
+	assert(rs != NULL);
+	assert(ri != NULL);
+	assert(tp != NULL);
+
+	size_t hash = hash64_init();
+	struct request_set_entry **handlep;
+	pthread_spinlock_t *bucket_lock;
+	struct request_set_entry *entry;
 
 #define REQUEST_LEN_MAX 4096
-	if (REQUEST_LEN_MAX < req_len)
-		WARNX("truncating request over %d bytes long", REQUEST_LEN_MAX);
-	req_len = MIN(req_len, REQUEST_LEN_MAX);
+	char raw_buf[REQUEST_LEN_MAX + 1] = {0};
+	size_t req_size = 0;
+	if (ri->request != NULL)
+		req_size = init_raw_request_from_src(ri->request, raw_buf, sizeof(raw_buf) - 1);
+	else
+		req_size = init_raw_request_from_fields(ri, raw_buf, sizeof(raw_buf) - 1);
 
-	char raw_buf[req_len + 1];
-	memcpy(raw_buf, src, req_len);
-	raw_buf[req_len] = '\0';
-
-	char trunc_buf[req_len + tp->max_alias_size * REQUEST_NTRUNCS_MAX + 1];
+	char trunc_buf[req_size + tp->max_alias_size * REQUEST_NTRUNCS_MAX + 1];
 	size_t trunc_size = truncate_raw_request(trunc_buf, sizeof(trunc_buf) - 1,
-	    raw_buf, req_len, tp);
+	    raw_buf, req_size, tp);
 
 	hash = hash64_update(hash, trunc_buf, trunc_size);
 	size_t bucket_idx = hash & REQUEST_SET_BUCKET_MASK;

@@ -1,1 +1,11 @@
-2018-12-10  10:00:15    DUB2    615 127.0.0.1   GET foobar.cloudfront.net   /login  200 http-kit/2.0    id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:10    DUB2    615 127.0.0.1   GET foobar.cloudfront.net   /login  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:20    DUB2    615 127.0.0.2   GET foobar.cloudfront.net   /login  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:30    DUB2    615 127.0.0.2   GET foobar.cloudfront.net   /data	200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:40    DUB2    615 127.0.0.3   GET foobar.cloudfront.net   /login  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:50    DUB2    615 127.0.0.4   GET foobar.cloudfront.net   /health 200 http-kit/2.0	id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:55    DUB2    615 127.0.0.5   GET foobar.cloudfront.net   /login  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:60    DUB2    615 127.0.0.1   GET foobar.cloudfront.net   /data   200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:70    DUB2    615 127.0.0.3   DELETE foobar.cloudfront.net   /data  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:75    DUB2    615 127.0.0.6   GET foobar.cloudfront.net   /login  200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:80    DUB2    615 127.0.0.4   GET foobar.cloudfront.net   /health	200 http-kit/2.0    id=monitor	my-api.foo  https   HTTP/1.1
+2018-12-10  10:00:90    DUB2    615 127.0.0.2   POST foobar.cloudfront.net   /data	200 Mozilla/5.0		id=user1    my-api.foo  https   HTTP/1.1
