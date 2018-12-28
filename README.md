@@ -1,12 +1,8 @@
-apathy
-------
-
-Access log PATH analYzer
-
 STATUS
 ------
 
-**WORK IN PROGRESS**
+**WORK IN PROGRESS - EXPECT BUGS**
+
 
 OVERVIEW
 --------
@@ -84,13 +80,12 @@ From the image we can observe at least the following facts:
 
 Other notes:
 
-  * The more calls an endpoint has, the larger the node
-  * The more hits an edge has, the thicker the line between two nodes
+  * The more calls an endpoint has, the larger the node.
+  * The more hits an edge has, the thicker the line between two nodes.
   * Edge lines from a lower depth node to an equal or higher depth node
-    are solid, while those from a lower depth node to a higher depth one
+    are solid, while those from a higher depth node to a lower depth one
     are dashed.
-  * Edge lines between a single node are dotted, as seen with the health
-    endpoint.
+  * Self-referential edge lines are dotted, as seen with the health endpoint.
   * Nodes are grouped by their minimum call depth from left to right,
     so that nodes on the left tend to be the first to be called, while
     those on the right tend to occur deeper during each session.
