@@ -5,7 +5,7 @@ CFLAGS=		-std=c99 \
 		-Wall \
 		-Wextra \
 		-D_DEFAULT_SOURCE \
-		-O0
+		-O2
 
 LDFLAGS=	-lm -lpthread
 
