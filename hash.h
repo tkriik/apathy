@@ -6,5 +6,6 @@
 
 uint64_t hash64_init(void);
 uint64_t hash64_update(uint64_t, const char *, size_t);
+uint64_t hash64_update_ipaddr(uint64_t, const char *);
 
 #endif

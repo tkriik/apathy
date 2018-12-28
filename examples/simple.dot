@@ -22,7 +22,7 @@ digraph apathy_graph {
 
     r0 -> r2 [xlabel="25.00% (3)", fontsize=28, style="solid", color="#b4888b", fontcolor="#876668", penwidth=4.000000];
     r1 -> r1 [xlabel="16.67% (2)", fontsize=25, style="dotted", color="#a89dbc", fontcolor="#7e768d", penwidth=3.632993];
-    r2 -> r4 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
     r2 -> r3 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
+    r2 -> r4 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
     r3 -> r0 [xlabel="8.33% (1)", fontsize=22, style="dashed", color="#9eb7ba", fontcolor="#76898b", penwidth=3.154701];
 }

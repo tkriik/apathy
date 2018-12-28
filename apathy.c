@@ -180,10 +180,6 @@ run_thread(void *ctx)
 			struct field_info *fi = &lc->scan_field_info[i];
 			struct field_view *fv = &fvs[fi->index];
 
-			if (fi->is_session) {
-				sid = hash64_update(sid, fv->src, fv->len);
-			}
-
 			switch (fi->type) {
 			case FIELD_RFC3339:
 				ts = rfc3339_with_ms_to_ms(fv->src);
@@ -193,6 +189,14 @@ run_thread(void *ctx)
 				break;
 			case FIELD_TIME:
 				ts += time_without_ms_to_ms(fv->src, NULL);
+				break;
+			case FIELD_IPADDR:
+				if (fi->is_session)
+					sid = hash64_update_ipaddr(sid, fv->src);
+				break;
+			case FIELD_USERAGENT:
+				if (fi->is_session)
+					sid = hash64_update(sid, fv->src, fv->len);
 				break;
 			case FIELD_REQUEST:
 				ri.request = fv->src;

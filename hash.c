@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <string.h>
 
 #include "hash.h"
 
@@ -27,4 +28,14 @@ hash64_update(uint64_t hash, const char *s, size_t len)
 		hash *= FNV_PRIME64;
 	}
 	return hash;
+}
+
+/*
+ * Hashes an IP address without the port number.
+ */
+uint64_t
+hash64_update_ipaddr(uint64_t hash, const char *s)
+{
+	size_t hash_len = strcspn(s, ": \t\n\v\r");
+	return hash64_update(hash, s, hash_len);
 }
