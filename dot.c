@@ -168,7 +168,8 @@ close_subgraph:
 		for (size_t e = 0; e < vertex->nedges; e++) {
 			struct path_graph_edge *edge = &vertex->edges[e];
 
-			double pct = 100 * ((double)edge->nhits / pg->total_nhits);
+			double pct = 100 *
+			    ((double)edge->nhits / (double)pg->total_edge_nhits);
 			double weight = calc_dot_weight(pg->total_nhits,
 			    edge->nhits);
 			int font_size = calc_dot_font_size(weight);

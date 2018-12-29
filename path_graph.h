@@ -39,6 +39,7 @@ struct path_graph {
 
 	/* Statistics */
 	uint64_t total_nhits;               /* Total number of hits */
+	uint64_t total_edge_nhits;          /* Total number of edge hits */
 };
 
 void init_path_graph(struct path_graph *, struct request_table *);

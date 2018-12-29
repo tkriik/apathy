@@ -31,6 +31,7 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 			vertex->nedges = 1;
 			vertex->total_nhits_out++;
 			pg->total_nedges++;
+			pg->total_edge_nhits++;
 		}
 
 		vertex->total_nhits_in++;
@@ -60,6 +61,7 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 			    / ((double)edge->nhits + 1);
 			edge->nhits++;
 			vertex->total_nhits_out++;
+			pg->total_edge_nhits++;
 			return;
 		}
 	}
@@ -86,6 +88,7 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 	vertex->nedges++;
 	vertex->total_nhits_out++;
 	pg->total_nedges++;
+	pg->total_edge_nhits++;
 }
 
 static int
@@ -140,6 +143,7 @@ init_path_graph(struct path_graph *pg, struct request_table *rt)
 
 	pg->total_nedges = 0;
 	pg->total_nhits = 0;
+	pg->total_edge_nhits = 0;
 	pg->nvertices = 0;
 	pg->capvertices = rt->nrequests;
 	pg->vertices = calloc(pg->capvertices, sizeof(*pg->vertices));
