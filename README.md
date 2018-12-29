@@ -54,11 +54,11 @@ Running the command below...
             r4 [label="DELETE http://my-api/data\n(in 8.33% (1), out 0.00% (0))", fontsize=22, style=filled, fillcolor="#9180b2", penwidth=3.154701];
         }
     
-        r0 -> r2 [xlabel="25.00% (3)", fontsize=28, style="solid", color="#b4888b", fontcolor="#876668", penwidth=4.000000];
-        r1 -> r1 [xlabel="16.67% (2)", fontsize=25, style="dotted", color="#a89dbc", fontcolor="#7e768d", penwidth=3.632993];
-        r2 -> r4 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
-        r2 -> r3 [xlabel="8.33% (1)", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
-        r3 -> r0 [xlabel="8.33% (1)", fontsize=22, style="dashed", color="#9eb7ba", fontcolor="#76898b", penwidth=3.154701];
+        r0 -> r2 [xlabel="25.00% (3)\n1.7s", fontsize=28, style="solid", color="#b4888b", fontcolor="#876668", penwidth=4.000000];
+        r1 -> r1 [xlabel="16.67% (2)\n3.8s", fontsize=25, style="dotted", color="#a89dbc", fontcolor="#7e768d", penwidth=3.632993];
+        r2 -> r3 [xlabel="8.33% (1)\n2.0s", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
+        r2 -> r4 [xlabel="8.33% (1)\n2.0s", fontsize=22, style="solid", color="#84cc94", fontcolor="#63996f", penwidth=3.154701];
+        r3 -> r0 [xlabel="8.33% (1)\n0.2s", fontsize=22, style="dashed", color="#9eb7ba", fontcolor="#76898b", penwidth=3.154701];
     }
 
 Now we can, for example, use the `dot` tool from `graphviz`
@@ -82,6 +82,14 @@ Other notes:
 
   * The more calls an endpoint has, the larger the node.
   * The more hits an edge has, the thicker the line between two nodes.
+  * The `in` percentage tells how many of all the requests in the log
+    ended up at that node, while the absolute count is in parentheses.
+  * The `out` percentage tells how many of the `in` requests continued
+    to other nodes, while the absolute count is in parentheses.
+  * The edge percentage tells how common that edge is in the whole
+    log, with the absolute edge count in parentheses.
+  * Below the edge percentage is the average duration for that edge,
+    in seconds.
   * Edge lines from a lower depth node to an equal or higher depth node
     are solid, while those from a higher depth node to a lower depth one
     are dashed.
