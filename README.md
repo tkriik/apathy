@@ -193,9 +193,7 @@ For example, using the file at `examples/truncate.txt`:
 TODO
 ----
 
-  * IP without port
   * RFC3339 without milliseconds
-  * duration info
   * query parameter session IDs
   * IPv6
   * ignore-patterns
