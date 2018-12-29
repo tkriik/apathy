@@ -193,15 +193,18 @@ close_subgraph:
 			color_t edge_label_color =
 			    node_to_edge_color(node_color, edge_label_mult);
 
+			double duration_sec = edge->duration_cma / 1000.0;
+
 			fprintf(out,
-"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\", "
+"    r%" PRIuRID " -> r%" PRIuRID " [xlabel=\"%.2lf%% (%" PRIu64 ")\\n%.1lfs\", "
                                     "fontsize=%d, "
 				    "style=\"%s\", "
 				    "color=" COLOR_FMT ", "
 				    "fontcolor=" COLOR_FMT ", "
 				    "penwidth=%lf];\n",
-			    rid, edge->rid, pct, edge->nhits, font_size, style,
-			    edge_color, edge_label_color, pen_width);
+			    rid, edge->rid, pct, edge->nhits, duration_sec,
+			    font_size, style, edge_color, edge_label_color,
+			    pen_width);
 		}
 	}
 

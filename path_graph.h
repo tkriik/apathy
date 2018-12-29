@@ -5,8 +5,9 @@
 #include "session.h"
 
 struct path_graph_edge {
-	request_id_t rid;   /* Outward request edge */
-	uint64_t     nhits; /* Hits per this edge */
+	request_id_t rid;          /* Outward request edge */
+	uint64_t     nhits;        /* Hits per this edge */
+	double       duration_cma; /* Cumulative moving average for duration (milliseconds) */
 };
 
 /* Path edge information. */

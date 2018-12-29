@@ -7,7 +7,8 @@
 
 static void
 amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
-                        request_id_t rid, request_id_t edge_rid)
+                        request_id_t rid, request_id_t edge_rid,
+			uint64_t ts, uint64_t edge_ts)
 {
 	assert(pg != NULL);
 	assert(rid != REQUEST_ID_INVAL);
@@ -26,6 +27,7 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 			edge = &vertex->edges[0];
 			edge->rid = edge_rid;
 			edge->nhits = 1;
+			edge->duration_cma = (double)edge_ts - (double)ts;
 			vertex->nedges = 1;
 			vertex->total_nhits_out++;
 			pg->total_nedges++;
@@ -51,6 +53,11 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 	for (edge_idx = 0; edge_idx < vertex->nedges; edge_idx++) {
 		edge = &vertex->edges[edge_idx];
 		if (edge->rid == edge_rid) {
+			double duration = (double)edge_ts - (double)ts;
+			double duration_cma = edge->duration_cma;
+			edge->duration_cma =
+			    (duration + (double)edge->nhits * duration_cma)
+			    / ((double)edge->nhits + 1);
 			edge->nhits++;
 			vertex->total_nhits_out++;
 			return;
@@ -74,6 +81,8 @@ amend_path_graph_vertex(struct path_graph *pg, uint64_t depth,
 	edge = &vertex->edges[edge_idx];
 	edge->rid = edge_rid;
 	edge->nhits = 1;
+	edge->duration_cma = (double)edge_ts - (double)ts;
+
 	vertex->nedges++;
 	vertex->total_nhits_out++;
 	pg->total_nedges++;
@@ -165,11 +174,20 @@ gen_path_graph(struct path_graph *pg, struct request_set *rs,
 			    sizeof(*entry->requests), cmp_session_request);
 			uint64_t depth = 1;
 			for (size_t r = 0, e = 1; r < entry->nrequests; r++, e++) {
-				request_id_t rid = entry->requests[r].rid;
-				request_id_t edge_rid = e < entry->nrequests
-				                      ? entry->requests[e].rid
-						      : REQUEST_ID_INVAL;
-				amend_path_graph_vertex(pg, depth, rid, edge_rid);
+				struct session_request *node_req = &entry->requests[r];
+				request_id_t rid = node_req->rid;
+				uint64_t ts = node_req->ts;
+
+				struct session_request *edge_req = NULL;
+				request_id_t edge_rid = REQUEST_ID_INVAL;
+				uint64_t edge_ts = 0;
+				if (e < entry->nrequests) {
+					edge_req = &entry->requests[e];
+					edge_rid = edge_req->rid;
+					edge_ts = edge_req->ts;
+				}
+				amend_path_graph_vertex(pg, depth, rid, edge_rid,
+				    ts, edge_ts);
 				depth = rid == edge_rid ? depth : depth + 1;
 			}
 		}
