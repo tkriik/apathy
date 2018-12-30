@@ -11,6 +11,10 @@
  * we can take this faster shortcut with manual parsing.
  */
 
+/*
+ * TODO: refactor to use common functions
+ */
+
 static const char ctoi[256] = {
 	['0'] = 0, ['1'] = 1, ['2'] = 2, ['3'] = 3, ['4'] = 4,
 	['5'] = 5, ['6'] = 6, ['7'] = 7, ['8'] = 8, ['9'] = 9
@@ -24,7 +28,7 @@ static const char ctoi[256] = {
 #define MS_IN_SEC   1000ULL
 
 uint64_t
-rfc3339_with_ms_to_ms(const char *s)
+rfc3339_to_ms(const char *s)
 {
 	uint64_t year = (ctoi[(int)s[0]] * 1000
 	              +  ctoi[(int)s[1]] * 100
@@ -57,7 +61,35 @@ rfc3339_with_ms_to_ms(const char *s)
 }
 
 uint64_t
-date_to_ms(const char *s, const char **endp)
+rfc3339_no_ms_to_ms(const char *s)
+{
+	uint64_t year = (ctoi[(int)s[0]] * 1000
+	              +  ctoi[(int)s[1]] * 100
+	              +  ctoi[(int)s[2]] * 10
+	              +  ctoi[(int)s[3]])
+	              - 1970;
+	s += 5; // Skip '-'
+	uint64_t month = ctoi[(int)s[0]] * 10
+	               + ctoi[(int)s[1]];
+	s += 3; // Skip '-'
+	uint64_t day = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip 'T'
+	uint64_t hour = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip ':'
+	uint64_t min = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+	s += 3; // Skip ':'
+	uint64_t sec = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
+
+	return year  * MS_IN_YEAR
+	     + month * MS_IN_MONTH
+	     + day   * MS_IN_DAY
+	     + hour  * MS_IN_HOUR
+	     + min   * MS_IN_MIN
+	     + sec   * MS_IN_SEC;
+}
+
+uint64_t
+date_to_ms(const char *s)
 {
 	assert(s != NULL);
 	assert(strnlen(s, 10) == 10);
@@ -78,14 +110,11 @@ date_to_ms(const char *s, const char **endp)
 	            + month * MS_IN_MONTH
 		    + day   * MS_IN_DAY;
 
-	if (endp != NULL)
-		*endp = s;
-
 	return ms;
 }
 
 uint64_t
-time_without_ms_to_ms(const char *s, const char **endp)
+time_to_ms(const char *s)
 {
 	uint64_t hour = ctoi[(int)s[0]] * 10 + ctoi[(int)s[1]];
 	s += 3; // Skip ':'
@@ -97,9 +126,6 @@ time_without_ms_to_ms(const char *s, const char **endp)
 	uint64_t ms = hour * MS_IN_HOUR
 	            + min  * MS_IN_MIN
 	            + sec  * MS_IN_SEC;
-
-	if (endp != NULL)
-		*endp = s;
 
 	return ms;
 }

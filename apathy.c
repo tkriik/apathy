@@ -182,13 +182,16 @@ run_thread(void *ctx)
 
 			switch (fi->type) {
 			case FIELD_RFC3339:
-				ts = rfc3339_with_ms_to_ms(fv->src);
+				ts = rfc3339_to_ms(fv->src);
+				break;
+			case FIELD_RFC3339_NO_MS:
+				ts = rfc3339_no_ms_to_ms(fv->src);
 				break;
 			case FIELD_DATE:
-				ts += date_to_ms(fv->src, NULL);
+				ts += date_to_ms(fv->src);
 				break;
 			case FIELD_TIME:
-				ts += time_without_ms_to_ms(fv->src, NULL);
+				ts += time_to_ms(fv->src);
 				break;
 			case FIELD_IPADDR:
 				if (fi->is_session)

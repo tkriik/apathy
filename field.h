@@ -4,9 +4,10 @@
 #include "file_view.h"
 #include "regex.h"
 
-#define NFIELD_TYPES 10
+#define NFIELD_TYPES 11
 enum field_type {
 	FIELD_RFC3339 = 0,
+	FIELD_RFC3339_NO_MS,
 	FIELD_DATE,
 	FIELD_TIME,
 

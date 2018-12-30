@@ -9,6 +9,7 @@
 
 static const enum field_type FIELD_TYPES[NFIELD_TYPES] = {
 	FIELD_RFC3339,
+	FIELD_RFC3339_NO_MS,
 	FIELD_DATE,
 	FIELD_TIME,
 
@@ -22,9 +23,10 @@ static const enum field_type FIELD_TYPES[NFIELD_TYPES] = {
 	FIELD_ENDPOINT
 };
 
-#define RFC3339_PATTERN   "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-#define DATE_PATTERN      "^[0-9]{4}-[0-9]{2}-[0-9]{2}"
-#define TIME_PATTERN      "^[0-9]{2}:[0-9]{2}:[0-9]{2}"
+#define RFC3339_PATTERN       "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}"
+#define RFC3339_NO_MS_PATTERN "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+#define DATE_PATTERN          "^[0-9]{4}-[0-9]{2}-[0-9]{2}"
+#define TIME_PATTERN          "^[0-9]{2}:[0-9]{2}:[0-9]{2}"
 
 #define IPV4_PATTERN      "^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}"
 #define USERAGENT_PATTERN "^(Mozilla|http-kit)"
@@ -37,18 +39,19 @@ static const enum field_type FIELD_TYPES[NFIELD_TYPES] = {
 #define ENDPOINT_PATTERN  "^\\/.+$"
 
 static const char *FIELD_PATTERNS[NFIELD_TYPES] = {
-	[FIELD_RFC3339]   = RFC3339_PATTERN,
-	[FIELD_DATE]      = DATE_PATTERN,
-	[FIELD_TIME]      = TIME_PATTERN,
+	[FIELD_RFC3339]       = RFC3339_PATTERN,
+	[FIELD_RFC3339_NO_MS] = RFC3339_NO_MS_PATTERN,
+	[FIELD_DATE]          = DATE_PATTERN,
+	[FIELD_TIME]          = TIME_PATTERN,
 
-	[FIELD_IPADDR]    = IPV4_PATTERN,
-	[FIELD_USERAGENT] = USERAGENT_PATTERN,
+	[FIELD_IPADDR]        = IPV4_PATTERN,
+	[FIELD_USERAGENT]     = USERAGENT_PATTERN,
 
-	[FIELD_REQUEST]   = REQUEST_PATTERN,
-	[FIELD_METHOD]    = METHOD_PATTERN,
-	[FIELD_PROTOCOL]  = PROTOCOL_PATTERN,
-	[FIELD_DOMAIN]    = DOMAIN_PATTERN,
-	[FIELD_ENDPOINT]  = ENDPOINT_PATTERN
+	[FIELD_REQUEST]       = REQUEST_PATTERN,
+	[FIELD_METHOD]        = METHOD_PATTERN,
+	[FIELD_PROTOCOL]      = PROTOCOL_PATTERN,
+	[FIELD_DOMAIN]        = DOMAIN_PATTERN,
+	[FIELD_ENDPOINT]      = ENDPOINT_PATTERN
 };
 
 /*
@@ -290,6 +293,8 @@ init_scan_fields(struct line_config *lc)
 {
 	if (is_field_set(lc, FIELD_RFC3339)) {
 		set_scan_field(lc, FIELD_RFC3339);
+	} else if (is_field_set(lc, FIELD_RFC3339_NO_MS)) {
+		set_scan_field(lc, FIELD_RFC3339_NO_MS);
 	} else if (is_field_set(lc, FIELD_DATE) && is_field_set(lc, FIELD_TIME)) {
 		set_scan_field(lc, FIELD_DATE);
 		set_scan_field(lc, FIELD_TIME);

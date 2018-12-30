@@ -125,10 +125,11 @@ See `./apathy --help` for command-line reference.
 
 #### Date fields
 
-One of the two variants below must be found:
+One of two variants below must be found:
 
-  * A single RFC3339-formatted timstamp field with millisecond precision
-    - example: `2018-12-12T12:00:01.000Z`
+  * A single RFC3339-formatted timestamp field, with or without
+    millisecond precision
+    - examples: `2018-12-12T12:00:01.000Z`, `2018-12-10T18:00:52`
   * Separate date and time fields, where date is in `YYYY-MM-DD` format,
     and time is in `HH:mm:SS` format.
     - example: `2018-12-12    12:00:01`
@@ -169,7 +170,7 @@ it:
 
 ### Truncate patterns
 
-If your log file contains endpoint that take path parameters, such as
+If your log file contains endpoints that take path parameters, such as
 UUIDs, then you probably want to combine their occurrences. You may do
 this manually with a tool like `sed`,
 but you may also use the `-T` / `--truncate-patterns` command line option
@@ -193,7 +194,9 @@ For example, using the file at `examples/truncate.txt`:
 TODO
 ----
 
-  * RFC3339 without milliseconds
   * query parameter session IDs
   * IPv6
   * ignore-patterns
+  * JSON output
+  * session listing
+  * tests
