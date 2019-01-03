@@ -1,0 +1,13 @@
+language: c
+
+compiler:
+    - clang
+    - gcc
+
+script:
+    - make clean all
+
+branches:
+    only:
+        - master
+        - travis-test
