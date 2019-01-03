@@ -1,5 +1,5 @@
 #include <assert.h>
-#include <pthread.h>
+#include <ck_spinlock.h>
 
 #include "hash.h"
 #include "request.h"
@@ -86,7 +86,7 @@ add_request_set_entry(struct request_set *rs, struct request_info *ri,
 
 	size_t hash = hash64_init();
 	struct request_set_entry **handlep;
-	pthread_spinlock_t *bucket_lock;
+	ck_spinlock_t *bucket_lock;
 	struct request_set_entry *entry;
 
 #define REQUEST_LEN_MAX 4096
@@ -107,8 +107,7 @@ add_request_set_entry(struct request_set *rs, struct request_info *ri,
 	bucket_lock = &rs->locks[bucket_idx];
 	entry = NULL;
 
-	if (pthread_spin_lock(bucket_lock) != 0)
-		ERR("%s", "pthread_spin_lock");
+	ck_spinlock_lock(bucket_lock);
 
 	HASH_FIND(hh, *handlep, trunc_buf, trunc_size, entry);
 	if (entry != NULL)
@@ -123,20 +122,18 @@ add_request_set_entry(struct request_set *rs, struct request_info *ri,
 		ERR("%s", "calloc");
 	memcpy(entry->data, trunc_buf, trunc_size);
 
-	if (pthread_spin_lock(&rs->rid_lock) != 0)
-		ERR("%s", "pthread_spin_lock");
+	ck_spinlock_lock(&rs->rid_lock);
 
 	entry->hash = hash;
 	entry->rid = rs->rid_ctr++;
-	if (pthread_spin_unlock(&rs->rid_lock) != 0)
-		ERR("%s", "pthread_spin_unlock");
+
+	ck_spinlock_unlock(&rs->rid_lock);
 
 	HASH_ADD_KEYPTR(hh, *handlep, entry->data, trunc_size, entry);
 	rs->nrequests++;
 
 finish:
-	if (pthread_spin_unlock(bucket_lock) != 0)
-		ERR("%s", "pthread_spin_unlock");
+	ck_spinlock_unlock(bucket_lock);
 
 	return entry->rid;
 }
@@ -146,12 +143,10 @@ init_request_set(struct request_set *rs)
 {
 	for (size_t i = 0; i< REQUEST_SET_NBUCKETS; i++) {
 		rs->handles[i] = NULL;
-		if (pthread_spin_init(&rs->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
-			ERR("%s", "pthread_spin_init");
+		ck_spinlock_init(&rs->locks[i]);
 	}
 
-	if (pthread_spin_init(&rs->rid_lock, PTHREAD_PROCESS_PRIVATE) != 0)
-		ERR("%s", "pthread_spin_init");
+	ck_spinlock_init(&rs->rid_lock);
 
 	rs->nrequests = 0;
 	rs->rid_ctr = REQUEST_ID_START;

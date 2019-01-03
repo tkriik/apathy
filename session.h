@@ -1,6 +1,7 @@
 #ifndef SESSION_H
 #define SESSION_H
 
+#include <ck_spinlock.h>
 #include <stdint.h>
 
 #include "request.h"
@@ -28,7 +29,7 @@ struct session_map_entry {
 #define SESSION_MAP_BUCKET_MASK (SESSION_MAP_NBUCKETS - 1)
 struct session_map {
 	struct session_map_entry *handles[SESSION_MAP_NBUCKETS];
-	pthread_spinlock_t    locks[SESSION_MAP_NBUCKETS];
+	ck_spinlock_t             locks[SESSION_MAP_NBUCKETS];
 };
 
 void init_session_map(struct session_map *);

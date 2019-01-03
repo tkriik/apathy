@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <ck_spinlock.h>
 #include <pthread.h>
 
 #include "hash.h"
@@ -10,8 +11,7 @@ init_session_map(struct session_map *sm)
 {
 	for (size_t i = 0; i < SESSION_MAP_NBUCKETS; i++) {
 		sm->handles[i] = NULL;
-		if (pthread_spin_init(&sm->locks[i], PTHREAD_PROCESS_PRIVATE) != 0)
-			ERR("%s", "pthread_spin_init");
+		ck_spinlock_init(&sm->locks[i]);
 	}
 }
 
@@ -27,7 +27,6 @@ amend_session_map_entry(struct session_map *sm, session_id_t sid, uint64_t ts,
 {
 	assert(sm != NULL);
 
-	int rc;
 	struct session_map_entry *entry = NULL;
 
 	/* TODO: make sid better distributed */
@@ -40,11 +39,9 @@ amend_session_map_entry(struct session_map *sm, session_id_t sid, uint64_t ts,
 	 * macros don't work as intended.
 	 */
 	struct session_map_entry **handlep = &sm->handles[bucket_idx];
-	pthread_spinlock_t *lock = &sm->locks[bucket_idx];
+	ck_spinlock_t *lock = &sm->locks[bucket_idx];
 
-	rc = pthread_spin_lock(lock);
-	if (rc != 0)
-		ERR("%s", "pthread_spin_lock");
+	ck_spinlock_lock(lock);
 
 	HASH_FIND_INT(*handlep, &sid, entry);
 	if (entry == NULL) {
@@ -85,7 +82,5 @@ amend_session_map_entry(struct session_map *sm, session_id_t sid, uint64_t ts,
 	entry->requests[r].ts = ts;
 	entry->nrequests++;
 finish:
-	rc = pthread_spin_unlock(lock);
-	if (rc != 0)
-		ERR("%s", "pthread_spin_unlock");
+	ck_spinlock_unlock(lock);
 }

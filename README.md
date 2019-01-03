@@ -109,9 +109,14 @@ which we can generate a graph like above.
 INSTALL
 -------
 
-Tested on Linux only at the moment.
+Compilation is tested only on Linux and OSX at the moment.
 
-Recent `clang` or `gcc`, and `pthreads` required.
+### Dependencies
+
+  * Recent GCC or Clang
+  * [Concurrency Kit](http://concurrencykit.org/)
+
+### Build
 
     $ make clean all
 

@@ -1,6 +1,7 @@
 #ifndef REQUEST_H
 #define REQUEST_H
 
+#include <ck_spinlock.h>
 #include <stdint.h>
 
 #include "lib/uthash.h"
@@ -32,11 +33,11 @@ struct request_set {
 #define REQUEST_SET_BUCKET_MASK        (REQUEST_SET_NBUCKETS - 1)
 #define REQUEST_SET_INIT_LIM_NREQUESTS 8
 	struct request_set_entry *handles[REQUEST_SET_NBUCKETS];
-	pthread_spinlock_t        locks[REQUEST_SET_NBUCKETS];
+	ck_spinlock_t             locks[REQUEST_SET_NBUCKETS];
 	size_t                    nrequests; /* Unique request count */
 #define REQUEST_ID_INVAL UINT64_MAX
 #define REQUEST_ID_START 0
-	pthread_spinlock_t        rid_lock;
+	ck_spinlock_t             rid_lock;
 	request_id_t              rid_ctr; /* Incremental request ID */
 };
 
