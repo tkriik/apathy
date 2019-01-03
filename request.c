@@ -121,7 +121,7 @@ add_request_set_entry(struct request_set *rs, struct request_info *ri,
 	entry->data = calloc(1, trunc_size + 1);
 	if (entry->data == NULL)
 		ERR("%s", "calloc");
-	memcpy((char *)entry->data, trunc_buf, trunc_size);
+	memcpy(entry->data, trunc_buf, trunc_size);
 
 	if (pthread_spin_lock(&rs->rid_lock) != 0)
 		ERR("%s", "pthread_spin_lock");

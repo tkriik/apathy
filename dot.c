@@ -158,7 +158,7 @@ close_subgraph:
 	}
 
 	/* Link nodes */
-	for (size_t v = 0; v < pg->capvertices; v++) {
+	for (v = 0; v < pg->capvertices; v++) {
 		vertex = &pg->vertices[v];
 		if (is_null_vertex(vertex))
 			continue;

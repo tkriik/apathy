@@ -20,7 +20,7 @@ struct request_info {
 
 /* Request field data and incremental ID, stored in a hash table. */
 struct request_set_entry {
-	const char   *data;
+	char         *data;
 	uint64_t      hash;
 	request_id_t  rid;
 

@@ -5,7 +5,24 @@ CFLAGS=		-std=c99 \
 		-Wall \
 		-Wextra \
 		-D_DEFAULT_SOURCE \
-		-O2
+		-O2 \
+		-Werror \
+		-Wall \
+		-Wextra \
+		-Wfloat-equal \
+		-Wshadow \
+		-Wpointer-arith \
+		-Wcast-align \
+		-Wstrict-prototypes \
+		-Wstrict-overflow=5 \
+		-Wwrite-strings \
+		-Waggregate-return \
+		-Wcast-qual \
+		-Wswitch-enum \
+		-Wundef \
+		-Wunreachable-code \
+		-Wuninitialized \
+		-Wformat=2
 
 LDFLAGS=	-lm -lpthread
 

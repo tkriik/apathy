@@ -216,6 +216,9 @@ run_thread(void *ctx)
 			case FIELD_ENDPOINT:
 				ri.endpoint = fv->src;
 				break;
+			case FIELD_UNKNOWN:
+				assert(0 && "NOTREACHED");
+				break;
 			default:
 				break;
 			}
