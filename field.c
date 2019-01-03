@@ -416,7 +416,8 @@ init_line_config(struct line_config *lc, struct file_view *log_view,
 
 	parse_session_fields(lc, session_fields);
 
-	struct field_view fvs[NALL_FIELDS_MAX] = {0};
+	struct field_view fvs[NALL_FIELDS_MAX];
+	memset(&fvs, 0, sizeof(fvs));
 	const char *endp;
 	size_t nall_fields = get_fields(fvs, NALL_FIELDS_MAX, src, 1, &endp);
 	if (nall_fields == NALL_FIELDS_MAX)

@@ -103,7 +103,8 @@ init_truncate_patterns(struct truncate_patterns *tp, const char *path)
 		const char *pattern;
 		get_pattern_alias(line, &alias, &pattern);
 
-		regex_t regex = {0};
+		regex_t regex;
+		memset(&regex, 0, sizeof(regex));
 		int cflags = REG_EXTENDED | REG_NEWLINE;
 		compile_regex(&regex, pattern, cflags);
 		tp->regexes[tp->npatterns] = regex;

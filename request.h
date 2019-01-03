@@ -3,13 +3,14 @@
 
 #include <ck_spinlock.h>
 #include <stdint.h>
+#include <inttypes.h>
 
 #include "lib/uthash.h"
 
 #include "truncate.h"
 
-typedef size_t request_id_t;
-#define PRIuRID "zu"
+typedef uint64_t request_id_t;
+#define PRIuRID PRIu64
 
 struct request_info {
 	const char *request; /* If this is null, the fields below are set, and vice versa. */

@@ -158,7 +158,8 @@ run_thread(void *ctx)
 			break;
 
 		int skip_line_seek = log_view->src == src;
-		struct field_view fvs[NALL_FIELDS_MAX] = {0};
+		struct field_view fvs[NALL_FIELDS_MAX];
+		memset(&fvs, 0, sizeof(fvs));
 
 		size_t nfields = get_fields(fvs, NALL_FIELDS_MAX, src, skip_line_seek, &src);
 		if (nfields != lc->nall_fields)
