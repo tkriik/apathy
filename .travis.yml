@@ -1,16 +1,29 @@
 language: c
 
+sudo: true
+
+git:
+  depth: 1
+
 os:
-    - linux
-    - osx
+  - linux
+  - osx
 
 compiler:
-    - clang
-    - gcc
+  - clang
+  - gcc
+
+install:
+  - wget http://concurrencykit.org/releases/ck-0.6.0.tar.gz
+  - tar -xzf ck-0.6.0.tar.gz
+  - cd ck-0.6.0/
+  - ./configure
+  - sudo make -s install
+  - cd ..
 
 script:
-    - make clean all
+  - make clean all
 
 branches:
-    only:
-        - master
+  only:
+    - master
